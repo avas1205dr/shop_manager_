@@ -52,7 +52,7 @@ def handle_start_help(message):
 def create_shop(message):
     msg = bot.send_message(message.chat.id, "Введите название магазина:")
     bot.register_next_step_handler(msg, save_shop)
-    
+
 
 def save_shop(message):
     shop_name = message.text.strip()
@@ -116,7 +116,7 @@ def save_product_price(message, shop_id, product_name):
     except ValueError:
         bot.send_message(message.chat.id, "Некорректная цена.Попробуйте снова.")
 
-# Показать товары выбранного магазина
+
 @bot.message_handler(commands=['listproducts'])
 def list_products(message):
     shops = cursor.execute("SELECT id, name FROM shops").fetchall()
