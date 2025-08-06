@@ -7,7 +7,7 @@ TOKEN = '7793591374:AAHYhGqYiNgg3EqKvSJFHsFxGCgpEKw7mgk'
 bot = telebot.TeleBot(TOKEN)
 
 # Подключение к базе данных
-conn = sqlite3.connect('shops.db', check_same_thread=False)
+conn = sqlite3.connect('db/shops.db', check_same_thread=False)
 cursor = conn.cursor()
 
 # Создание таблиц, если не существуют
