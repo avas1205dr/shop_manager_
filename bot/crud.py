@@ -105,11 +105,11 @@ def save_shop(message):
 @bot.message_handler(commands=['list_my_shops'])
 def list_my_shops(message):
     shops = get_shops_by_tg_id(message.from_user.id)
-    owner_id = get_owner_by_shop_id(message.from_user.id)
+    owner_id = message.from_user.id
     if not shops:
         bot.send_message(message.chat.id, "Нет созданных магазинов.")
         return
-    response = "Магазины:\n" + "\n".join([f"id владельца: {owner_id}\n {shop[1]}" for shop in shops])
+    response = "Магазины:\n" + "\n".join([f"id владельца: {owner_id}\nНазвание: {shop[1]}" for shop in shops])
     bot.send_message(message.chat.id, response)
 
 
