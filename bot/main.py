@@ -21,7 +21,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             payment_detail TEXT,
-            owner_id VARCHAR,
+            owner_id INTEGER,
             bot_api TEXT
         )
     ''')
@@ -68,27 +68,21 @@ if not os.path.exists('images'):
 
 # Функции для БД
 def get_shops_by_tg_id(tg_id):
-    return cursor.execute("SELECT id, name FROM shops WHERE owner_id = (?)", (tg_id,)).fetchall()
+    return cursor.execute("SELECT id, name FROM shops WHERE owner_id = ?", (tg_id,)).fetchall()
 
 def add_user(message):
-    username = message.from_user.username
-    cursor.execute(f'''
-        INSERT INTO users(username)
-        VALUES('{username}');''')
-    
-    conn.commit()
-    cursor.execute(f'''
-        UPDATE users
-        SET tg_id = '{message.from_user.id}'
-        WHERE username = '{username}';
-    ''')
-    conn.commit()
+    username = message.from_user.username if message.from_user.username else str(message.from_user.id)
+    cursor.execute('SELECT id FROM users WHERE tg_id = ?', (message.from_user.id,))
+    if not cursor.fetchone():
+        cursor.execute('INSERT INTO users(username, tg_id) VALUES(?, ?)', (username, message.from_user.id))
+        conn.commit()
     return 
 
-def get_owner_by_shop_id(shop_id) -> int:
-    return cursor.execute("SELECT tg_id FROM users INNER JOIN shops ON users.id = shops.owner_id WHERE shops.id = (?)", (shop_id,))
+def get_owner_by_shop_id(shop_id):
+    return cursor.execute("SELECT owner_id FROM shops WHERE id = ?", (shop_id,)).fetchone()[0]
 
-
+# Временное хранилище данных
+user_temp_data = {}
 
 @bot.message_handler(commands=['start', 'help', 'Главное меню'])
 def handle_start_help(message):
@@ -102,34 +96,6 @@ def handle_start_help(message):
     )
     add_user(message)
     bot.send_message(message.chat.id, help_text)
-    
-@bot.message_handler(commands=['newshop'])
-def create_shop(message):
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True) #создание новых кнопок
-    btn1 = telebot.types.KeyboardButton('Ввести токен')
-    btn2 = telebot.types.KeyboardButton('Ввести название')
-    markup.add(btn1, btn2)
-    msg = (
-    "Введите название магазина, потом токен бота: Как получить токен?\n "
-    "Краткая инструкция по созданию бота в BotFather (Telegram):\n"
-    "1) Откройте Telegram и найдите @BotFather (официальный бот для создания ботов).\n"
-    "2) Запустите бота и нажмите /start или /newbot.\n"
-    "3) Укажите имя бота (отображаемое в чатах, например, TestBot).\n"
-    "4) Придумайте юзернейм бота (должен заканчиваться на bot, например, TestExampleBot).\n"
-    "5) Получите API-токен (сохраните, он нужен для управления ботом).\n"
-    "6) Настройте бота через команды:\n"
-    "7) /setdescription - описание бота.\n"
-    "8) /setabouttext - краткая информация.\n"
-    "9) /setcommands - список команд.\n"
-    "10) Готово! Теперь можно программировать бота на Python (aiogram, python-telegram-bot), Node.js (telegraf) или других языках.\n"
-    "🔹 Пример токена: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11 (никому не передавайте!)\n")
-    bot.send_message(message.chat.id, msg, reply_markup=markup)
-
-# Временное хранилище данных
-user_temp_data = {}
-
-# Временное хранилище данных
-user_temp_data = {}
 
 @bot.message_handler(commands=['newshop'])
 def handle_new_shop(message):
@@ -257,28 +223,6 @@ def handle_menu_actions(message):
     markup.add(types.KeyboardButton('Ввести токен'), types.KeyboardButton('Ввести название'))
     bot.send_message(message.chat.id, 'Выберите действие:', reply_markup=markup)
 
-def link_bot_to_shop(shop_id, bot_token):
-    try:
-        # Сначала создаем или находим бота
-        cursor.execute('INSERT OR IGNORE INTO bots (token) VALUES (?)', (bot_token,))
-        
-        # Получаем ID бота
-        cursor.execute('SELECT id FROM bots WHERE token = ?', (bot_token,))
-        bot_id = cursor.fetchone()[0]
-        
-        # Связываем магазин и бота
-        cursor.execute('''
-            INSERT OR IGNORE INTO shop_bots (shop_id, bot_id)
-            VALUES (?, ?)
-        ''', (shop_id, bot_id))
-        
-        conn.commit()
-        return True
-    except sqlite3.Error as e:
-        print(f"Ошибка при привязке бота: {e}")
-        return False
-
-
 @bot.message_handler(commands=['list_my_shops'])
 def list_my_shops(message):
     shops = get_shops_by_tg_id(message.from_user.id)
@@ -288,7 +232,6 @@ def list_my_shops(message):
         return
     response = "Магазины:\n" + "\n".join([f"id владельца: {owner_id}\nНазвание: {shop[1]}" for shop in shops])
     bot.send_message(message.chat.id, response)
-
 
 @bot.message_handler(commands=['addproduct'])
 def add_product(message):
@@ -359,7 +302,6 @@ def save_product_photo(message, shop_id, product_name, description, price):
                 filename = f"{uuid.uuid4()}.{file_ext}"
                 filepath = os.path.join('images', filename)
                 
-                import shutil
                 shutil.copy(default_image, filepath)
             else:
                 bot.send_message(message.chat.id, "Фото не получено, а дефолтное изображение не найдено.")
@@ -391,10 +333,9 @@ def save_product_photo(message, shop_id, product_name, description, price):
     except Exception as e:
         bot.send_message(message.chat.id, f"Произошла ошибка: {str(e)}")
 
-# Показать товары выбранного магазина
 @bot.message_handler(commands=['listproducts'])
 def list_products(message):
-    shops = cursor.execute("SELECT id, name FROM shops").fetchall()
+    shops = get_shops_by_tg_id(message.from_user.id)
     if not shops:
         bot.send_message(message.chat.id, "Нет магазинов.")
         return
@@ -402,27 +343,77 @@ def list_products(message):
     msg = bot.send_message(message.chat.id, f"Выберите магазин, указав его номер:\n{shop_list}")
     bot.register_next_step_handler(msg, show_products_for_shop)
 
+def show_products_for_shop(message, shop_id=None, page=0):
+    try:
+        if shop_id is None:
+            shop_id = int(message.text.strip())
+        
+        shop_exists = cursor.execute("SELECT id FROM shops WHERE id=?", (shop_id,)).fetchone()
+        if not shop_exists:
+            bot.send_message(message.chat.id, "Магазин не найден.")
+            return
+        
+        # Получаем все товары для магазина
+        products = cursor.execute("SELECT id, name, price FROM products WHERE shop_id=? ORDER BY id", (shop_id,)).fetchall()
+        
+        if not products:
+            bot.send_message(message.chat.id, "Нет товаров для этого магазина.")
+            return
+        
+        # Разбиваем на страницы по 5 товаров
+        products_per_page = 5
+        total_pages = (len(products) + products_per_page - 1) // products_per_page
+        start_index = page * products_per_page
+        end_index = start_index + products_per_page
+        current_products = products[start_index:end_index]
+        
+        # Создаем сообщение с товарами
+        response = f"🛍️ Товары магазина (страница {page+1}/{total_pages}):\n\n"
+        for product_id, name, price in current_products:
+            response += f"🔹 {name} - {price} руб.\n"
+        
+        # Создаем клавиатуру с кнопками
+        markup = types.InlineKeyboardMarkup()
+        
+        # Добавляем кнопки редактирования для каждого товара
+        for product_id, name, price in current_products:
+            markup.add(types.InlineKeyboardButton(
+                text=f"✏️ {name}",
+                callback_data=f"edit_product_{product_id}"
+            ))
+        
+        # Добавляем кнопки пагинации
+        pagination_buttons = []
+        if page > 0:
+            pagination_buttons.append(types.InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=f"products_page_{shop_id}_{page-1}"
+            ))
+        if page < total_pages - 1:
+            pagination_buttons.append(types.InlineKeyboardButton(
+                text="Вперед ➡️",
+                callback_data=f"products_page_{shop_id}_{page+1}"
+            ))
+        
+        if pagination_buttons:
+            markup.row(*pagination_buttons)
+        
+        # Добавляем кнопку возврата
+        markup.add(types.InlineKeyboardButton(
+            text="🔙 Назад к магазинам",
+            callback_data="back_to_shops"
+        ))
+        
+        # Отправляем сообщение
+        bot.send_message(message.chat.id, response, reply_markup=markup)
+    except ValueError:
+        bot.send_message(message.chat.id, "Некорректный номер.")
 
-
-# Обработчик callback-ов для пагинации и редактирования
-@bot.callback_query_handler(func=lambda call: True)
-def handle_product_callbacks(call):
-    if call.data.startswith("products_page_"):
-        # Обработка пагинации
-        _, _, shop_id, page = call.data.split("_")
-        show_products_for_shop(call.message, int(page))
-        bot.answer_callback_query(call.id)
-    elif call.data.startswith("edit_product_"):
-        # Обработка кнопки редактирования
-        product_id = call.data.split("_")[2]
-        edit_product_menu(call.message, product_id)
-        bot.answer_callback_query(call.id)
-    elif call.data == "back_to_shops":
-        # Возврат к списку магазинов
-        shops = get_shops_by_tg_id(call.from_user.id)
-        shop_list = "\n".join([f"{shop[0]}. {shop[1]}" for shop in shops])
-        bot.send_message(call.message.chat.id, f"Ваши магазины:\n{shop_list}")
-        bot.answer_callback_query(call.id)
+@bot.callback_query_handler(func=lambda call: call.data.startswith("edit_product_"))
+def handle_edit_product(call):
+    product_id = call.data.split("_")[2]
+    edit_product_menu(call.message, product_id)
+    bot.answer_callback_query(call.id)
 
 def edit_product_menu(message, product_id):
     product = cursor.execute("SELECT id, name, price, description, image_path FROM products WHERE id=?", (product_id,)).fetchone()
@@ -462,8 +453,6 @@ def edit_product_menu(message, product_id):
     except Exception as e:
         bot.send_message(message.chat.id, response, reply_markup=markup)
         print(f"Ошибка при отправке фото: {e}")
-
-
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("edit_name_"))
 def handle_edit_name(call):
@@ -624,82 +613,20 @@ def handle_cancel_delete(call):
     )
     edit_product_menu(call.message, product_id)
 
-# Обновленный обработчик для пагинации
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_shops")
+def handle_back_to_shops(call):
+    list_my_shops(call.message)
+    bot.answer_callback_query(call.id)
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("products_page_"))
 def handle_products_pagination(call):
     try:
         parts = call.data.split("_")
-        shop_id = parts[2]
+        shop_id = int(parts[2])
         page = int(parts[3])
         show_products_for_shop(call.message, shop_id=shop_id, page=page)
         bot.answer_callback_query(call.id)
     except Exception as e:
         bot.answer_callback_query(call.id, f"Ошибка: {str(e)}")
-
-# Небольшая модификация функции show_products_for_shop для работы с shop_id как параметром
-def show_products_for_shop(message, shop_id=None, page=0):
-    try:
-        if shop_id is None:
-            shop_id = int(message.text.strip())
-        
-        shop_exists = cursor.execute("SELECT id FROM shops WHERE id=?", (shop_id,)).fetchone()
-        if not shop_exists:
-            bot.send_message(message.chat.id, "Магазин не найден.")
-            return
-        
-        # Получаем все товары для магазина
-        products = cursor.execute("SELECT id, name, price FROM products WHERE shop_id=? ORDER BY id", (shop_id,)).fetchall()
-        
-        if not products:
-            bot.send_message(message.chat.id, "Нет товаров для этого магазина.")
-            return
-        
-        # Разбиваем на страницы по 5 товаров
-        products_per_page = 1
-        total_pages = (len(products) // products_per_page) + (1 if len(products) % products_per_page else 0)
-        start_index = page * products_per_page
-        end_index = start_index + products_per_page
-        current_products = products[start_index:end_index]
-        
-        # Создаем сообщение с товарами
-        response = f"🛍️ Товары магазина (страница {page+1}/{total_pages}):\n\n"
-        for product_id, name, price in current_products:
-            response += f"🔹 {name} - {price} руб.\n"
-        
-        # Создаем клавиатуру с кнопками
-        markup = types.InlineKeyboardMarkup()
-        
-        # Добавляем кнопки редактирования для каждого товара
-        for product_id, name, price in current_products:
-            markup.add(types.InlineKeyboardButton(
-                text=f"✏️ {name}",
-                callback_data=f"edit_product_{product_id}"
-            ))
-        
-        # Добавляем кнопки пагинации
-        pagination_buttons = []
-        if page > 0:
-            pagination_buttons.append(types.InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data=f"products_page_{shop_id}_{page-1}"
-            ))
-        if page < total_pages - 1:
-            pagination_buttons.append(types.InlineKeyboardButton(
-                text="Вперед ➡️",
-                callback_data=f"products_page_{shop_id}_{page+1}"
-            ))
-        
-        if pagination_buttons:
-            markup.row(*pagination_buttons)
-        
-        # Добавляем кнопку возврата
-        markup.add(types.InlineKeyboardButton(
-            text="🔙 Назад к магазинам",
-            callback_data="back_to_shops"
-        ))
-        # Отправляем сообщение
-        bot.send_message(message.chat.id, response, reply_markup=markup)
-    except ValueError:
-        bot.send_message(message.chat.id, "Некорректный номер.")
 
 bot.polling(non_stop=True)
