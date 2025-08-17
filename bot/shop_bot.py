@@ -323,7 +323,7 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
                 review_count = result[1] or 0
 
                 cursor.execute("""
-                    SELECT u.username, r.rating, r.review_text
+                    SELECT DISTINCT u.username, r.rating, r.review_text
                     FROM reviews r
                     LEFT JOIN users u ON r.user_id = u.tg_id
                     WHERE r.shop_id = ?
@@ -511,7 +511,7 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
                     stars = "⭐" * int(rating)
                     text += f"{name} {stars} ({rating:.1f})\n"
                     if username:
-                        markup.add(telebot.types.InlineKeyboardButton("Посетить магазин", url=f"https://t.me/{username}"))
+                        markup.add(telebot.types.InlineKeyboardButton(f"Посетить магазин {username}", url=f"https://t.me/{username}"))
                 markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
                 shop_bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
@@ -564,10 +564,7 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         cursor.execute("INSERT INTO reviews (shop_id, user_id, rating, review_text) VALUES (?, ?, ?, ?)",
                       (shop_id, user_id, rating, review_text))
         username = message.from_user.username or None
-        cursor.execute("INSERT OR IGNORE INTO users (tg_id, username) VALUES (?, ?)",
-                      (user_id, username))
-        cursor.execute("UPDATE users SET username = ? WHERE tg_id = ?",
-                      (username, user_id))
+        database.add_user(user_id, username)
         conn.commit()
         conn.close()
         

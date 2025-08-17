@@ -192,7 +192,7 @@ def add_worker_handler(message):
             if result:
                 username = result[1]
             else:
-                cursor.execute("INSERT INTO users (tg_id) VALUES (?)", (admin_user_id,))
+                database.add_user(admin_user_id)
                 conn.commit()
         except ValueError:
             bot.send_message(message.chat.id, "❌ Введите корректный @username или ID пользователя")

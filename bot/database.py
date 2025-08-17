@@ -37,7 +37,8 @@ def init_database():
         tg_id INTEGER
     )
     ''')
-
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tg_id ON users(tg_id)")
+    
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS shop_admins (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -638,10 +639,10 @@ def add_user(tg_id, username=None):
     with db_lock:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT username FROM users WHERE tg_id = ?", (tg_id,))
-        existing = cursor.fetchone()
+        cursor.execute("SELECT 1 FROM users WHERE tg_id = ?", (tg_id,))
+        exists = cursor.fetchone() is not None
         
-        if not existing:
+        if not exists:
             cursor.execute("INSERT INTO users (tg_id, username) VALUES (?, ?)", (tg_id, username))
         elif username:
             cursor.execute("UPDATE users SET username = ? WHERE tg_id = ?", (username, tg_id))
