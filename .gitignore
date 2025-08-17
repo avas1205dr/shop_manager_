@@ -1,2 +1,3 @@
 /.env
-/db
+
+shop_manager.db
