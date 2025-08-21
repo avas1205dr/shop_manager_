@@ -8,6 +8,7 @@ class UserState:
     ADDING_PRODUCT = "adding_product"
     PRODUCT_NAME = "product_name"
     PRODUCT_PRICE = "product_price"
+    PRODUCT_TYPE = "product_type"
     PRODUCT_DESCRIPTION = "product_description"
     PRODUCT_IMAGE = "product_image"
     EDITING_PAYMENT = "editing_payment"
@@ -19,6 +20,7 @@ class UserState:
     REMOVING_WORKER = "removing_worker"
     EDITING_CATEGORY_NAME = "editing_category_name"
     DELETING_CATEGORY = "deleting_category"
+    EDITING_PAYMASTER = "editing_paymaster"
 
 class ShopBotState:
     MAIN_MENU = "main_menu"
@@ -36,3 +38,4 @@ class ShopBotState:
     SEARCH_INPUT = "search_input"
     FILTER_MIN_PRICE = "filter_min_price"
     FILTER_MAX_PRICE = "filter_max_price"
+    ENTERING_QUANTITY = "entering_quantity"

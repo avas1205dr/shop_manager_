@@ -10,6 +10,7 @@ import keyboards as keyboards
 import shop_bot
 from states import UserState
 from telebot import types
+import config
 
 logging.basicConfig(level=logging.ERROR)
 
@@ -17,8 +18,7 @@ user_product_messages = {}
 active_shop_bots = {}
 user_states = {}
 
-BOT_TOKEN = "7793591374:AAHYhGqYiNgg3EqKvSJFHsFxGCgpEKw7mgk"
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(config.BOT_TOKEN)
 
 @bot.message_handler(commands=['start'])
 def start_handler(message):
@@ -29,6 +29,14 @@ def start_handler(message):
     welcome_text = """🛍️ Добро пожаловать в Shop Manager Bot!
 
 Этот бот поможет вам создать и управлять собственными магазинными ботами в Telegram.
+
+Для того чтобы настроить ваш магазин нужно:
+• Создать магазин в нашем боте
+• Создать бота через @BotFather, скопировать API-токен и вставить в разделе API бота
+• Также в @BotFather настроить Payments (инструкция есть в разделе Paymaster) и отправить токен
+• Добавить работников, товары, категории и т.д.
+• Готово!
+
 
 Возможности:
 • Создание неограниченного количества магазинов
@@ -69,15 +77,30 @@ def show_manager_product(call):
         bot.answer_callback_query(call.id, "Товар не найден")
         return
     
-    prod_id, cat_id, name, desc, price, image_path, created_at, popularity_score = product
+    (prod_id, cat_id, name, desc, price, image_path, is_digital, created_at, popularity_score) = product
     text = f"{name}\nЦена: {price}₽\nОписание: {desc or 'Нет'}"
     markup = keyboards.create_edit_product_menu(product_id, category_id, page)
+    
+    bot.delete_message(call.message.chat.id, call.message.message_id)
     
     if image_path and os.path.exists(image_path) and "default_not_image" not in image_path:
         with open(image_path, 'rb') as photo:
             bot.send_photo(call.message.chat.id, photo, caption=text, reply_markup=markup)
     else:
         bot.send_message(call.message.chat.id, text, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("back_to_products_"))
+def handle_back_to_products(call):
+    parts = call.data.split("_")
+    category_id = int(parts[3])
+    page = int(parts[4])
+    
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    bot.send_message(
+        call.message.chat.id,
+        "📦 Товары в разделе:",
+        reply_markup=keyboards.create_products_menu(category_id, page)
+    )
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_from_desc")
 def handle_back_from_desc(call):
@@ -96,9 +119,10 @@ def handle_default_image(call):
     product_name = user_states.get(f"{user_id}_product_name")
     product_price = user_states.get(f"{user_id}_product_price")
     description = user_states.get(f"{user_id}_product_description")
+    is_digital = user_states.get(f"{user_id}_product_is_digital", True)
     
     image_path = "work_photos/default_not_image.jpg"
-    product_id = database.add_product(category_id, product_name, product_price, image_path, description)
+    product_id = database.add_product(category_id, product_name, product_price, image_path, is_digital, description)
     
     if product_id:
         bot.answer_callback_query(call.id, "✅ Товар добавлен со стандартным изображением")
@@ -122,8 +146,9 @@ def handle_skip_image(call):
     product_name = user_states.get(f"{user_id}_product_name")
     product_price = user_states.get(f"{user_id}_product_price")
     description = user_states.get(f"{user_id}_product_description")
+    is_digital = user_states.get(f"{user_id}_product_is_digital", True)
     
-    product_id = database.add_product(category_id, product_name, product_price, None, description)
+    product_id = database.add_product(category_id, product_name, product_price, None, is_digital, description)
     
     if product_id:
         bot.answer_callback_query(call.id, "✅ Товар добавлен без изображения")
@@ -149,6 +174,58 @@ def handle_back_from_image(call):
         call.message.chat.id,
         call.message.message_id
     )
+    
+    
+@bot.callback_query_handler(func=lambda call: call.data.startswith("paymaster_token_"))
+def paymaster_token_handler(call):
+    shop_id = int(call.data.split("_")[-1])
+    user_states[call.from_user.id] = UserState.EDITING_PAYMASTER
+    user_states[f"{call.from_user.id}_shop_id"] = shop_id
+    
+    instruction_text = """💳 Настройка PayMaster:
+
+1. Перейдите в @BotFather
+2. Выберите вашего бота
+3. Перейдите в раздел "Payments"
+4. Выберите "PayMaster" как провайдера платежей
+5. Скопируйте полученный токен
+
+Отправьте токен в следующем сообщении или 'назад' для отмены:"""
+    
+    bot.edit_message_text(
+        instruction_text,
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboards.create_back_button_menu(f"manage_shop_{shop_id}")
+    )
+
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id) == UserState.EDITING_PAYMASTER)
+def save_paymaster_token(message):
+    user_id = message.from_user.id
+    shop_id = user_states.get(f"{user_id}_shop_id")
+    token = message.text.strip()
+    
+    if token.lower() == 'назад':
+        user_states[user_id] = UserState.SHOP_MENU
+        bot.send_message(
+            message.chat.id,
+            "❌ Настройка PayMaster отменена",
+            reply_markup=keyboards.create_shop_management_menu(shop_id))
+        return
+    
+    if len(token) < 10:
+        bot.send_message(message.chat.id, "❌ Токен слишком короткий. Попробуйте снова или отправьте 'назад' для отмены")
+        return
+    
+    if database.update_paymaster_token(shop_id, token):
+        bot.send_message(
+            message.chat.id,
+            "✅ PayMaster токен успешно сохранен!",
+            reply_markup=keyboards.create_shop_management_menu(shop_id))
+    else:
+        bot.send_message(message.chat.id, "❌ Ошибка при сохранении токена")
+    
+    user_states[user_id] = UserState.SHOP_MENU
 
 @bot.message_handler(func=lambda message: user_states.get(message.from_user.id) == UserState.ADDING_WORKER)
 def add_worker_handler(message):
@@ -656,6 +733,47 @@ def callback_handler(call):
                 call.message.message_id,
                 reply_markup=keyboards.create_workers_menu(shop_id))
         
+        elif data.startswith("view_orders_"):
+            shop_id = int(data.split("_")[-1])
+            orders = database.get_shop_orders(shop_id)
+            
+            if not orders:
+                bot.edit_message_text(
+                    "📋 Заказы\n\nЗаказов пока нет",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=keyboards.create_back_button_menu(f"manage_shop_{shop_id}"))
+                return
+            
+            text = "📋 Заказы\n\n"
+            markup = keyboards.create_orders_menu(shop_id, orders)
+            
+            bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup)
+
+        elif data.startswith("orders_page_"):
+            parts = data.split("_")
+            shop_id = int(parts[2])
+            page = int(parts[3])
+            orders = database.get_shop_orders(shop_id)
+            
+            text = "📋 Заказы\n\n"
+            markup = keyboards.create_orders_menu(shop_id, orders, page)
+            
+            bot.edit_message_text(
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup)
+
+        elif data.startswith("order_detail_"):
+            order_id = int(data.split("_")[-1])
+            # Здесь можно реализовать просмотр деталей заказа
+            bot.answer_callback_query(call.id, "Функция в разработке")
+        
         elif data.startswith("edit_category_name_"):
             category_id = int(data.split("_")[-1])
             user_states[user_id] = UserState.EDITING_CATEGORY_NAME
@@ -1100,20 +1218,30 @@ def text_handler(message):
             if price <= 0:
                 raise ValueError()
             user_states[f"{user_id}_product_price"] = price
-            user_states[user_id] = UserState.PRODUCT_DESCRIPTION
+            user_states[user_id] = UserState.PRODUCT_TYPE
             
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="back_from_desc"))
-            
-            bot.send_message(
-                message.chat.id,
-                "Введите описание товара (или '-' чтобы пропустить):",
-                reply_markup=markup
-            )
+            markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
+            markup.add("Цифровой", "Физический")
+            bot.send_message(message.chat.id, "Выберите тип товара:", reply_markup=markup)
         except:
             bot.send_message(message.chat.id, "❌ Некорректная цена. Введите положительное число")
             return
+    
+    elif user_state == UserState.PRODUCT_TYPE:
+        product_type = message.text.strip().lower()
+        if product_type not in ['цифровой', 'физический']:
+            bot.send_message(message.chat.id, "Пожалуйста, выберите тип товара, используя кнопки.")
+            return
+            
+        is_digital = (product_type == 'цифровой')
+        user_states[f"{user_id}_product_is_digital"] = is_digital
+        user_states[user_id] = UserState.PRODUCT_DESCRIPTION
         
+        remove_keyboard = types.ReplyKeyboardRemove()
+        bot.send_message(message.chat.id, 
+                        "Введите описание товара (или '-' чтобы пропустить):",
+                        reply_markup=remove_keyboard)
+    
     elif user_state == UserState.PRODUCT_DESCRIPTION:
         description = message.text.strip()
         if description == '-':
@@ -1257,8 +1385,10 @@ def handle_product_image_photo(message):
     product_name = user_states.get(f"{user_id}_product_name")
     product_price = user_states.get(f"{user_id}_product_price")
     description = user_states.get(f"{user_id}_product_description")
+    is_digital = user_states.get(f"{user_id}_product_is_digital", True)
     
-    product_id = database.add_product(category_id, product_name, product_price, image_path, description)
+    
+    product_id = database.add_product(category_id, product_name, product_price, image_path, is_digital, description)
     if not product_id:
         bot.send_message(message.chat.id, "❌ Ошибка при добавлении товара")
         return
@@ -1287,6 +1417,7 @@ def handle_product_image_text(message):
     product_name = user_states.get(f"{user_id}_product_name")
     product_price = user_states.get(f"{user_id}_product_price")
     description = user_states.get(f"{user_id}_product_description")
+    is_digital = user_states.get(f"{user_id}_product_is_digital", True)
     
     if text == 'назад':
         user_states[user_id] = UserState.PRODUCT_DESCRIPTION
@@ -1305,7 +1436,7 @@ def handle_product_image_text(message):
         bot.send_message(message.chat.id, "❌ Некорректная опция. Отправьте фото, 'Пропустить', 'Стандартное' или 'назад'")
         return
         
-    product_id = database.add_product(category_id, product_name, product_price, image_path, description)
+    product_id = database.add_product(category_id, product_name, product_price, image_path, is_digital, description)
     if not product_id:
         bot.send_message(message.chat.id, "❌ Ошибка при добавлении товара")
         return
@@ -1375,12 +1506,13 @@ def handle_edit_product_photo(message):
     )
     user_states[user_id] = UserState.SHOP_MENU
 
+
 if __name__ == "__main__":
     print("Инициализация базы данных...")
     database.init_database()
     print("База данных готова!")
     
-    print(f"Бот-менеджер запущен! Токен: {BOT_TOKEN}")
+    print(f"Бот-менеджер запущен! Токен: {config.BOT_TOKEN}")
     
     conn = sqlite3.connect(database.DB_NAME)
     cursor = conn.cursor()

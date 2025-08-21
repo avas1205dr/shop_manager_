@@ -25,7 +25,8 @@ def init_database():
         bot_username TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         is_running INTEGER DEFAULT 0,
-        yookassa_credentials TEXT
+        yookassa_credentials TEXT,
+        paymaster_token TEXT
     )
     ''')
     
@@ -65,6 +66,7 @@ def init_database():
         description TEXT,
         price REAL NOT NULL,
         image_path TEXT,
+        is_digital BOOLEAN DEFAULT TRUE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         popularity_score INTEGER DEFAULT 0,
         FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE CASCADE
@@ -84,18 +86,20 @@ def init_database():
     ''')
     
     cursor.execute('''
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        shop_id INTEGER NOT NULL,
-        customer_user_id INTEGER NOT NULL,
-        product_id INTEGER NOT NULL,
-        delivery_address TEXT NOT NULL,
-        payment_status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE,
-        FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE CASCADE
-    )
-    ''')
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shop_id INTEGER NOT NULL,
+            customer_user_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            total_price REAL NOT NULL,
+            delivery_address TEXT NOT NULL,
+            status TEXT DEFAULT 'new',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE,
+            FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE CASCADE
+        )
+        ''')
     
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS cart (
@@ -128,9 +132,11 @@ def init_database():
         cursor.execute("ALTER TABLE shops ADD COLUMN is_running INTEGER DEFAULT 0")
     if 'yookassa_credentials' not in columns:
         cursor.execute("ALTER TABLE shops ADD COLUMN yookassa_credentials TEXT")
+    if 'paymaster_token' not in columns:
+        cursor.execute("ALTER TABLE shops ADD COLUMN paymaster_token TEXT")
     if 'bot_username' not in columns:
         cursor.execute("ALTER TABLE shops ADD COLUMN bot_username TEXT")
-    
+        
     cursor.execute("PRAGMA table_info(products)")
     columns = [col[1] for col in cursor.fetchall()]
     if 'description' not in columns:
@@ -351,7 +357,7 @@ def get_category_products(category_id):
     conn.close()
     return products
 
-def add_product(category_id, name, price, image_path, description=None):
+def add_product(category_id, name, price, image_path, is_digital=True, description=None):
     if not isinstance(category_id, int) or category_id <= 0:
         return None
     if not name or not isinstance(name, str) or len(name) < 2:
@@ -364,14 +370,14 @@ def add_product(category_id, name, price, image_path, description=None):
         return None
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO products (category_id, name, price, image_path, description) VALUES (?, ?, ?, ?, ?)", 
-                  (category_id, name, price, image_path, description))
+    cursor.execute("INSERT INTO products (category_id, name, price, image_path, is_digital, description) VALUES (?, ?, ?, ?, ?, ?)", 
+                  (category_id, name, price, image_path, is_digital, description))
     product_id = cursor.lastrowid
     conn.commit()
     conn.close()
     return product_id
 
-def update_product(product_id, name=None, price=None, description=None, image_path=None):
+def update_product(product_id, name=None, price=None, description=None, image_path=None, is_digital=None):
     if not isinstance(product_id, int) or product_id <= 0:
         return
     conn = sqlite3.connect(DB_NAME)
@@ -403,6 +409,9 @@ def update_product(product_id, name=None, price=None, description=None, image_pa
             return
         updates.append("image_path = ?")
         params.append(image_path)
+    if is_digital is not None:
+        updates.append("is_digital = ?")
+        params.append(is_digital)
     
     if updates:
         query = "UPDATE products SET " + ", ".join(updates) + " WHERE id = ?"
@@ -590,6 +599,26 @@ def create_payment_link(amount, product_id, shop_id):
         logging.error(f"Ошибка при создании платежа: {e}")
         return None
 
+def buy_product(shop_id, user_id, product_id, quantity, total_price, delivery_address='Цифровой товар'):
+    if not all([isinstance(x, int) and x > 0 for x in (shop_id, user_id, product_id, quantity)]):
+        return False
+    if not isinstance(total_price, (int, float)) or total_price <= 0:
+        return False
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO orders (shop_id, customer_user_id, product_id, quantity, total_price, delivery_address) VALUES (?, ?, ?, ?, ?, ?)",
+            (shop_id, user_id, product_id, quantity, total_price, delivery_address)
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Ошибка при добавлении заказа: {e}")
+        return False
+    finally:
+        conn.close()
+    
 def get_user_info_by_id(user_id):
     if not isinstance(user_id, int) or user_id <= 0:
         return False
@@ -700,3 +729,80 @@ def remove_worker(shop_id, user_id):
         conn.commit()
         conn.close()
     return True
+
+def get_shop_orders(shop_id):
+    if not isinstance(shop_id, int) or shop_id <= 0:
+        return []
+    
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT o.id, o.customer_user_id, p.name, o.quantity, o.total_price, 
+               o.delivery_address, o.status, o.created_at, u.username
+        FROM orders o
+        JOIN products p ON o.product_id = p.id
+        LEFT JOIN users u ON o.customer_user_id = u.tg_id
+        WHERE o.shop_id = ?
+        ORDER BY o.created_at DESC
+    ''', (shop_id,))
+    orders = cursor.fetchall()
+    conn.close()
+    return orders
+
+
+def update_cart_quantity(shop_id, user_id, product_id, delta):
+    """Обновляет количество товара в корзине"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # Получаем текущее количество
+    cursor.execute("SELECT quantity FROM cart WHERE shop_id=? AND user_id=? AND product_id=?", 
+                  (shop_id, user_id, product_id))
+    result = cursor.fetchone()
+    
+    if result:
+        new_quantity = result[0] + delta
+        if new_quantity <= 0:
+            # Удаляем товар если количество стало 0 или меньше
+            cursor.execute("DELETE FROM cart WHERE shop_id=? AND user_id=? AND product_id=?", 
+                          (shop_id, user_id, product_id))
+        else:
+            # Обновляем количество
+            cursor.execute("UPDATE cart SET quantity=? WHERE shop_id=? AND user_id=? AND product_id=?", 
+                          (new_quantity, shop_id, user_id, product_id))
+    
+    conn.commit()
+    conn.close()
+
+def get_cart_quantity(shop_id, user_id, product_id):
+    """Получает текущее количество товара в корзине"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT quantity FROM cart WHERE shop_id=? AND user_id=? AND product_id=?", 
+                  (shop_id, user_id, product_id))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else 0
+
+def update_paymaster_token(shop_id, token):
+    if not isinstance(shop_id, int) or shop_id <= 0:
+        return False
+    if not token or not isinstance(token, str) or len(token) < 10:
+        return False
+    
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE shops SET paymaster_token = ? WHERE id = ?", (token, shop_id))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_paymaster_token_by_shop_id(shop_id):
+    if not isinstance(shop_id, int) or shop_id <= 0:
+        return False
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT paymaster_token FROM shops WHERE id=?", (shop_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res[0] if res else None

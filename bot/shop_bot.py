@@ -3,10 +3,15 @@ import sqlite3
 import telebot
 import logging
 
+from telebot import types
+
+import config
 import database as database
 import keyboards as keyboards
 from states import ShopBotState
 
+
+PRODUCTS_PER_PAGE = 5
 
 def run_shop_bot(shop_id, bot_token, welcome_message):
     shop_bot = telebot.TeleBot(bot_token)
@@ -24,19 +29,38 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         markup.add(btn_recs)
         return markup
 
-    def show_products_list(call, products, title="Товары", back_data="shop_main_menu"):
+    def show_products_list(call, products, title="Товары", back_data="shop_main_menu", page=0):
         if not products:
             shop_bot.edit_message_text("Нет товаров.", call.message.chat.id, call.message.message_id, reply_markup=create_shop_main_menu())
             return
-        text = title + "\n\n"
+        
+        total_pages = (len(products) + PRODUCTS_PER_PAGE - 1) // PRODUCTS_PER_PAGE
+        start_idx = page * PRODUCTS_PER_PAGE
+        end_idx = start_idx + PRODUCTS_PER_PAGE
+        page_products = products[start_idx:end_idx]
+
+        text = f"{title} (Страница {page+1}/{total_pages})\n\n"
         markup = telebot.types.InlineKeyboardMarkup(row_width=1)
-        for product in products:
+        
+        for product in page_products:
             product_id = product[0]
             name = product[2] if len(product) > 5 else product[1]
             price = product[4] if len(product) > 5 else product[2]
             text += f"{name} (ID: {product_id}) - {price}₽\n"
             markup.add(telebot.types.InlineKeyboardButton(f"Просмотреть {name}", callback_data=f"view_product_{product_id}"))
+
+        # Кнопки пагинации
+        pagination_buttons = []
+        if page > 0:
+            pagination_buttons.append(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=f"products_page_{page-1}"))
+        if page < total_pages - 1:
+            pagination_buttons.append(telebot.types.InlineKeyboardButton("➡️ Вперед", callback_data=f"products_page_{page+1}"))
+        
+        if pagination_buttons:
+            markup.row(*pagination_buttons)
+        
         markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data=back_data))
+        
         shop_bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
     def show_product_detail(call, product_id):
@@ -53,6 +77,7 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         
         caption = f"📱 Артикул: {prod_id}\n📦 {name}\n💰 {price} RUB\n📝 {description or 'Нет описания'}"
         markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("👛 Заказать", callback_data=f"buy_product_{prod_id}"))
         markup.add(telebot.types.InlineKeyboardButton("🛒 Добавить в корзину", callback_data=f"add_to_cart_{prod_id}"))
         markup.add(telebot.types.InlineKeyboardButton("◀️ Назад", callback_data="back_to_list"))
         if image_path and os.path.exists(image_path):
@@ -117,8 +142,8 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         for product_id, name, price, quantity in items:
             total_price += price * quantity
             order_details += f"📦 {name} x{quantity} - {price * quantity}₽\n"
-            cursor.execute("INSERT INTO orders (shop_id, customer_user_id, product_id, delivery_address) VALUES (?, ?, ?, ?)",
-                         (shop_id, customer_id, product_id, delivery_address))
+            cursor.execute("INSERT INTO orders (shop_id, customer_user_id, product_id, total_price, delivery_address) VALUES (?, ?, ?, ?, ?)",
+                         (shop_id, customer_id, product_id, total_price, delivery_address))
             order_ids.append(cursor.lastrowid)
         
         conn.commit()
@@ -192,20 +217,25 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
 
                 total_price = 0
                 cart_text = "🛒 Ваша корзина:\n\n"
-                markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+                markup = telebot.types.InlineKeyboardMarkup(row_width=4)
 
                 for product_id, name, price, quantity in items:
                     item_total = price * quantity
                     total_price += item_total
-                    cart_text += f"📦 {name} x{quantity} - {item_total}₽\n"
-                    markup.add(telebot.types.InlineKeyboardButton(f"❌ Удалить {name}", callback_data=f"remove_from_cart_{product_id}"))
+                    cart_text += f"📦 {name}\n   Цена: {price}₽ x {quantity} = {item_total}₽\n"
+                    markup.row(
+                        telebot.types.InlineKeyboardButton(f"❌ {name}", callback_data=f"remove_from_cart_{product_id}"),
+                        telebot.types.InlineKeyboardButton("➖", callback_data=f"decrease_cart_{product_id}"),
+                        telebot.types.InlineKeyboardButton(f"{quantity}", callback_data=f"change_quantity_{product_id}"),
+                        telebot.types.InlineKeyboardButton("➕", callback_data=f"increase_cart_{product_id}")
+                    )
 
                 cart_text += f"\n💰 Итог: {total_price}₽"
-                markup.add(
+                markup.row(
                     telebot.types.InlineKeyboardButton("✅ Оформить заказ", callback_data="order_cart"),
                     telebot.types.InlineKeyboardButton("🗑️ Очистить корзину", callback_data="clear_cart")
                 )
-                markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
+                markup.row(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
 
                 shop_bot.edit_message_text(
                     cart_text,
@@ -214,6 +244,128 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
                     reply_markup=markup
                 )
 
+            elif data.startswith("increase_cart_"):
+                product_id = int(data.split("_")[-1])
+                database.update_cart_quantity(shop_id, user_id, product_id, 1)
+                # Обновляем сообщение корзины
+                items = database.get_cart_items(shop_id, user_id)
+                if not items:
+                    shop_bot.edit_message_text(
+                        "🛒 Ваша корзина пуста",
+                        call.message.chat.id,
+                        call.message.message_id,
+                        reply_markup=create_shop_main_menu()
+                    )
+                    return
+
+                total_price = 0
+                cart_text = "🛒 Ваша корзина:\n\n"
+                markup = telebot.types.InlineKeyboardMarkup(row_width=4)
+
+                for product_id, name, price, quantity in items:
+                    item_total = price * quantity
+                    total_price += item_total
+                    cart_text += f"📦 {name}\n   Цена: {price}₽ x {quantity} = {item_total}₽\n"
+                    markup.row(
+                        telebot.types.InlineKeyboardButton(f"❌ {name}", callback_data=f"remove_from_cart_{product_id}"),
+                        telebot.types.InlineKeyboardButton("➖", callback_data=f"decrease_cart_{product_id}"),
+                        telebot.types.InlineKeyboardButton(f"{quantity}", callback_data=f"change_quantity_{product_id}"),
+                        telebot.types.InlineKeyboardButton("➕", callback_data=f"increase_cart_{product_id}")
+                    )
+
+                cart_text += f"\n💰 Итог: {total_price}₽"
+                markup.row(
+                    telebot.types.InlineKeyboardButton("✅ Оформить заказ", callback_data="order_cart"),
+                    telebot.types.InlineKeyboardButton("🗑️ Очистить корзину", callback_data="clear_cart")
+                )
+                markup.row(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
+
+                try:
+                    shop_bot.edit_message_text(
+                        cart_text,
+                        call.message.chat.id,
+                        call.message.message_id,
+                        reply_markup=markup
+                    )
+                except telebot.apihelper.ApiTelegramException as e:
+                    if "message is not modified" in str(e):
+                        pass
+                    else:
+                        raise e
+                
+                
+            elif data.startswith("decrease_cart_"):
+                product_id = int(data.split("_")[-1])
+                current_quantity = database.get_cart_quantity(shop_id, user_id, product_id)
+                if current_quantity > 1:
+                    database.update_cart_quantity(shop_id, user_id, product_id, -1)
+                else:
+                    database.remove_from_cart(shop_id, user_id, product_id)
+                
+                # Обновляем сообщение корзины
+                items = database.get_cart_items(shop_id, user_id)
+                if not items:
+                    shop_bot.edit_message_text(
+                        "🛒 Ваша корзина пуста",
+                        call.message.chat.id,
+                        call.message.message_id,
+                        reply_markup=create_shop_main_menu()
+                    )
+                    return
+
+                total_price = 0
+                cart_text = "🛒 Ваша корзина:\n\n"
+                markup = telebot.types.InlineKeyboardMarkup(row_width=4)
+
+                for product_id, name, price, quantity in items:
+                    item_total = price * quantity
+                    total_price += item_total
+                    cart_text += f"📦 {name}\n   Цена: {price}₽ x {quantity} = {item_total}₽\n"
+                    markup.row(
+                        telebot.types.InlineKeyboardButton(f"❌ {name}", callback_data=f"remove_from_cart_{product_id}"),
+                        telebot.types.InlineKeyboardButton("➖", callback_data=f"decrease_cart_{product_id}"),
+                        telebot.types.InlineKeyboardButton(f"{quantity}", callback_data=f"change_quantity_{product_id}"),
+                        telebot.types.InlineKeyboardButton("➕", callback_data=f"increase_cart_{product_id}")
+                    )
+
+                cart_text += f"\n💰 Итог: {total_price}₽"
+                markup.row(
+                    telebot.types.InlineKeyboardButton("✅ Оформить заказ", callback_data="order_cart"),
+                    telebot.types.InlineKeyboardButton("🗑️ Очистить корзину", callback_data="clear_cart")
+                )
+                markup.row(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
+
+                try:
+                    shop_bot.edit_message_text(
+                        cart_text,
+                        call.message.chat.id,
+                        call.message.message_id,
+                        reply_markup=markup
+                    )
+                except telebot.apihelper.ApiTelegramException as e:
+                    if "message is not modified" in str(e):
+                        pass
+                    else:
+                        raise e
+    
+            elif data.startswith("buy_product_"):
+                product_id = int(data.split("_")[-1])
+                product = database.get_product_info(product_id)
+                if not product:
+                    shop_bot.answer_callback_query(call.id, "Товар не найден")
+                    return
+            
+                shop_bot_states[user_id] = ShopBotState.ENTERING_QUANTITY
+                shop_bot_states[f"{user_id}_product_id"] = product_id
+                
+                shop_bot.send_message(
+                    call.message.chat.id,
+                    "Введите количество товара:",
+                    reply_markup=keyboards.create_back_button_menu(f"view_product_{product_id}")
+                )
+                shop_bot.answer_callback_query(call.id)
+                
+            
             elif data.startswith("add_to_cart_"):
                 product_id = int(data.split("_")[-1])
                 if database.add_to_cart(shop_id, user_id, product_id):
@@ -303,7 +455,14 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
                         markup.add(telebot.types.InlineKeyboardButton(name, callback_data=f"shop_category_{cat_id}"))
                     markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
                     shop_bot.edit_message_text("Выберите категорию:", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
+            
+            elif data.startswith("products_page_"):
+                page = int(data.split("_")[-1])
+                products = shop_bot_states.get(f"{user_id}_current_list", [])
+                title = shop_bot_states.get(f"{user_id}_current_title", "Товары")
+                back_data = shop_bot_states.get(f"{user_id}_current_back", "shop_main_menu")
+                show_products_list(call, products, title, back_data, page)
+            
             elif data == "shop_main_menu":
                 shop_bot_states[user_id] = ShopBotState.MAIN_MENU
                 shop_info = database.get_shop_info(shop_id)
@@ -586,22 +745,26 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
             markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
             shop_bot.send_message(message.chat.id, "🔍 Поиск товаров:\nВыберите тип:", reply_markup=markup)
             return
+        
         type_ = shop_bot_states.get(f"{message.from_user.id}_search_type")
         if type_ == 'id' and not query.isdigit():
             shop_bot.send_message(message.chat.id, "Артикул должен быть числом. Попробуйте снова.")
             return
+        
         results = database.search_products(shop_id, query, type_)
         shop_bot_states[f"{message.from_user.id}_current_list"] = results
         shop_bot_states[f"{message.from_user.id}_current_title"] = "Результаты поиска"
         shop_bot_states[f"{message.from_user.id}_current_back"] = "shop_search"
-        text = "Результаты поиска:\n\n"
-        markup = telebot.types.InlineKeyboardMarkup(row_width=1)
-        for product in results:
-            product_id, _, name, _, price, _ = product[:6]
-            text += f"{name} (ID: {product_id}) - {price}₽\n"
-            markup.add(telebot.types.InlineKeyboardButton(f"Просмотреть {name}", callback_data=f"view_product_{product_id}"))
-        markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_search"))
-        shop_bot.send_message(message.chat.id, text, reply_markup=markup)
+        
+        # Создаем искусственный call объект
+        class FakeCall:
+            def __init__(self, message):
+                self.message = message
+                self.from_user = message.from_user
+                self.data = "search_results"
+        
+        fake_call = FakeCall(message)
+        show_products_list(fake_call, results, "Результаты поиска", "shop_search")
 
     @shop_bot.message_handler(func=lambda message: shop_bot_states.get(message.from_user.id) == ShopBotState.FILTER_MIN_PRICE)
     def handle_filter_min_price(message):
@@ -642,7 +805,77 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
             shop_bot.send_message(message.chat.id, text, reply_markup=markup)
         except:
             shop_bot.send_message(message.chat.id, "Некорректная цена. Введите положительное число или 'назад'.")
+    
+    @shop_bot.message_handler(func=lambda message: shop_bot_states.get(message.from_user.id) == ShopBotState.ENTERING_QUANTITY)
+    def handle_quantity_input(message):
+        user_id = message.from_user.id
+        if message.text.strip().lower() == 'назад':
+            product_id = shop_bot_states.get(f"{user_id}_product_id")
+            shop_bot_states[user_id] = ShopBotState.MAIN_MENU
+            shop_bot.send_message(
+                message.chat.id,
+                "Отмена заказа",
+                reply_markup=create_shop_main_menu()
+            )
+            return
 
+        try:
+            quantity = int(message.text)
+            if quantity <= 0:
+                raise ValueError
+            
+            product_id = shop_bot_states.get(f"{user_id}_product_id")
+            product = database.get_product_info(product_id)
+            
+            if not product:
+                shop_bot.send_message(message.chat.id, "Товар не найден")
+                return
+
+            # Создаем инвойс с указанным количеством
+            title = product[2]
+            description = product[3] or "Покупка товара"
+            price = int(float(product[4]) * 100 * quantity)
+            payload = f"product_{product_id}_user_{user_id}_quantity_{quantity}"
+            payment_token = database.get_paymaster_token_by_shop_id(shop_id)
+            
+            shop_bot.send_invoice(
+                message.chat.id,
+                title,
+                description,
+                payload,
+                payment_token,
+                'rub',
+                [types.LabeledPrice(label=f"{title} x{quantity}", amount=price)],
+                start_parameter='product',
+            )
+            
+            shop_bot_states[user_id] = ShopBotState.MAIN_MENU
+            
+        except ValueError:
+            shop_bot.send_message(message.chat.id, "Пожалуйста, введите корректное количество (целое число больше 0):")
+
+    @shop_bot.message_handler(content_types=['successful_payment'])
+    def handle_successful_payment(message):
+        try:
+            payload_parts = message.successful_payment.invoice_payload.split('_')
+            product_id = int(payload_parts[1])
+            user_id = int(payload_parts[3])
+            quantity = int(payload_parts[5])
+            total_price = message.successful_payment.total_amount / 100
+            
+            if database.buy_product(shop_id, user_id, product_id, quantity, total_price, 'Цифровой товар (оплачено)'):
+                shop_bot.send_message(message.chat.id, "✅ Товар успешно оплачен и добавлен в ваши покупки!")
+            else:
+                shop_bot.send_message(message.chat.id, "❌ Ошибка при обработке покупки")
+                
+        except Exception as e:
+            logging.error(f"Ошибка обработки оплаты: {e}")
+            shop_bot.send_message(message.chat.id, "❌ Произошла ошибка при обработке платежа")
+
+    @shop_bot.pre_checkout_query_handler(lambda query: True)
+    def pre_checkout_query(pre_checkout_q: types.PreCheckoutQuery):
+        shop_bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+        
     try:
         shop_bot.infinity_polling()
     except Exception as e:

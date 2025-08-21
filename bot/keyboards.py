@@ -51,15 +51,17 @@ def create_my_shops_menu(user_id):
 def create_shop_management_menu(shop_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     btn_token = types.InlineKeyboardButton("🔑 API бота", callback_data=f"edit_token_{shop_id}")
+    btn_paymaster = types.InlineKeyboardButton("💳 PayMaster Токен", callback_data=f"paymaster_token_{shop_id}")
     btn_products = types.InlineKeyboardButton("📦 Товары", callback_data=f"manage_products_{shop_id}")
     btn_all_products = types.InlineKeyboardButton("📦 Все товары", callback_data=f"all_products_{shop_id}")
+    btn_orders = types.InlineKeyboardButton("📋 Заказы", callback_data=f"view_orders_{shop_id}")
     btn_workers = types.InlineKeyboardButton("👥 Работники", callback_data=f"workers_{shop_id}")
     btn_delete = types.InlineKeyboardButton("🗑️ Удалить магазин", callback_data=f"delete_shop_{shop_id}")
     btn_back = types.InlineKeyboardButton("⬅️ Назад", callback_data="my_shops")
     
-    markup.add(btn_token)
+    markup.add(btn_token, btn_paymaster)
     markup.add(btn_products, btn_all_products)
-    markup.add(btn_workers)
+    markup.add(btn_workers, btn_orders)
     btn_payment = types.InlineKeyboardButton("💳 Способ оплаты", callback_data=f"payment_method_{shop_id}")
     btn_welcome = types.InlineKeyboardButton("👋 Приветствие", callback_data=f"edit_welcome_{shop_id}")
     markup.add(btn_payment, btn_welcome)
@@ -93,6 +95,31 @@ def create_confirm_remove_step2_menu(shop_id, worker_id):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("╤╧╨┼УВОЛИТЬ┼╨╧╤", callback_data=f"do_remove_{shop_id}_{worker_id}"))
     markup.add(types.InlineKeyboardButton("❌ Отмена", callback_data=f"remove_worker_{shop_id}"))
+    return markup
+
+def create_orders_menu(shop_id, orders, page=0, per_page=5):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    start_idx = page * per_page
+    end_idx = min(start_idx + per_page, len(orders))
+    
+    for i in range(start_idx, end_idx):
+        order = orders[i]
+        order_id, _, product_name, quantity, total_price, _, status, _, username = order
+        btn_text = f"#{order_id} {product_name} x{quantity} - {status}"
+        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"order_detail_{order_id}"))
+    
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"orders_page_{shop_id}_{page-1}"))
+    if end_idx < len(orders):
+        nav_buttons.append(types.InlineKeyboardButton("Вперёд ➡️", callback_data=f"orders_page_{shop_id}_{page+1}"))
+    
+    if nav_buttons:
+        markup.row(*nav_buttons)
+    
+    markup.add(types.InlineKeyboardButton("🔄 Обновить", callback_data=f"view_orders_{shop_id}"))
+    markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"manage_shop_{shop_id}"))
     return markup
 
 def create_categories_menu(shop_id):
