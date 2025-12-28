@@ -5,7 +5,6 @@ import logging
 
 from telebot import types
 
-import config
 import database as database
 import keyboards as keyboards
 from states import ShopBotState

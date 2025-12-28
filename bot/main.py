@@ -704,8 +704,8 @@ def callback_handler(call):
             result = cursor.fetchone()
             cursor.execute(f"""
                 DELETE FROM shop_admins
-                WHERE user_id = '{worker_id}' AND shop_id = '{shop_id}'
-            """)
+                WHERE user_id = ? AND shop_id = ?
+            """, (worker_id, shop_id))
             username = result[0] if result else None
             conn.close()
             shop_info = database.get_shop_info(shop_id)
