@@ -717,14 +717,10 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         else:
             review_text = message.text.strip()
         
-        conn = sqlite3.connect(database.DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO reviews (shop_id, user_id, rating, review_text) VALUES (?, ?, ?, ?)",
-                      (shop_id, user_id, rating, review_text))
         username = message.from_user.username or None
         database.add_user(user_id, username)
-        conn.commit()
-        conn.close()
+        
+        database.add_review(shop_id, user_id, rating, review_text)
         
         shop_bot.send_message(
             message.chat.id,
