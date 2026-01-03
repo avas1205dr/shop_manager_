@@ -56,17 +56,36 @@ def create_shop_management_menu(shop_id):
     btn_all_products = types.InlineKeyboardButton("📦 Все товары", callback_data=f"all_products_{shop_id}")
     btn_orders = types.InlineKeyboardButton("📋 Заказы", callback_data=f"view_orders_{shop_id}")
     btn_workers = types.InlineKeyboardButton("👥 Работники", callback_data=f"workers_{shop_id}")
+    btn_broadcast = types.InlineKeyboardButton("📢 Рассылка", callback_data=f"broadcast_{shop_id}") # НОВАЯ КНОПКА
     btn_delete = types.InlineKeyboardButton("🗑️ Удалить магазин", callback_data=f"delete_shop_{shop_id}")
     btn_back = types.InlineKeyboardButton("⬅️ Назад", callback_data="my_shops")
     
     markup.add(btn_token, btn_paymaster)
     markup.add(btn_products, btn_all_products)
     markup.add(btn_workers, btn_orders)
+    markup.add(btn_broadcast)
     btn_payment = types.InlineKeyboardButton("💳 Способ оплаты", callback_data=f"payment_method_{shop_id}")
     btn_welcome = types.InlineKeyboardButton("👋 Приветствие", callback_data=f"edit_welcome_{shop_id}")
     markup.add(btn_payment, btn_welcome)
     markup.add(btn_delete)
     markup.add(btn_back)
+    return markup
+
+def create_shop_reviews_pagination(page, total_count, per_page=5):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    buttons = []
+    
+    if page > 0:
+        buttons.append(types.InlineKeyboardButton("⬅️", callback_data=f"reviews_prev_{page-1}"))
+    
+    if (page + 1) * per_page < total_count:
+        buttons.append(types.InlineKeyboardButton("➡️", callback_data=f"reviews_next_{page+1}"))
+        
+    if buttons:
+        markup.row(*buttons)
+        
+    markup.add(types.InlineKeyboardButton("💬 Оставить отзыв", callback_data="shop_leave_review"))
+    markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
     return markup
 
 def create_workers_menu(shop_id):

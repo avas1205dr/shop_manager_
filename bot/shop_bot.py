@@ -27,7 +27,7 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         markup.add(btn_reviews, btn_search)
         markup.add(btn_recs)
         return markup
-
+    
     def show_products_list(call, products, title="Товары", back_data="shop_main_menu", page=0):
         if not products:
             shop_bot.edit_message_text("Нет товаров.", call.message.chat.id, call.message.message_id, reply_markup=create_shop_main_menu())
@@ -186,9 +186,42 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         database.clear_cart(shop_id, customer_id)
         shop_bot_states[customer_id] = ShopBotState.MAIN_MENU
 
+    def show_reviews_page(chat_id, message_id, page=0):
+        conn = sqlite3.connect(database.DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT AVG(rating), COUNT(*) FROM reviews WHERE shop_id = ?", (shop_id,))
+        stats = cursor.fetchone()
+        conn.close()
+        
+        avg_rating = float(stats[0] or 0)
+        total_reviews_count = stats[1] or 0
+
+        reviews_list, _ = database.get_shop_reviews(shop_id, page=page)
+        
+        rating_stars = "⭐" * int(avg_rating) if avg_rating > 0 else "Нет оценок"
+        text = f"📊 Отзывы о магазине\n"
+        text += f"Рейтинг: {rating_stars} ({avg_rating:.1f}/5)\n"
+        text += f"Всего отзывов: {total_reviews_count}\n\n"
+        
+        if not reviews_list:
+            text += "Отзывов пока нет. Будьте первыми!"
+        else:
+            for username, rating, review_text, date in reviews_list:
+                user_display = f"@{username}" if username else "Аноним"
+                stars = "⭐" * rating
+                clean_date = date.split(' ')[0] if date else ""
+                content = review_text if review_text else "Без текста"
+                text += f"👤 {user_display} ({clean_date})\n{stars}\n💬 {content}\n\n"
+                
+        markup = keyboards.create_shop_reviews_pagination(page, total_reviews_count)
+        
+        shop_bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+    
     @shop_bot.message_handler(commands=['start'])
     def shop_start_handler(message):
         database.add_user(message.from_user.id, message.from_user.username)
+        database.register_shop_user(shop_id, message.from_user.id)
+
         user_id = message.from_user.id
         shop_bot_states[user_id] = ShopBotState.MAIN_MENU
         shop_bot.send_message(
@@ -196,7 +229,7 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
             welcome_message,
             reply_markup=create_shop_main_menu()
         )
-
+    
     @shop_bot.callback_query_handler(func=lambda call: True)
     def shop_callback_handler(call):
         user_id = call.from_user.id
@@ -472,47 +505,40 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
                     reply_markup=create_shop_main_menu()
                 )
 
-            elif data == "shop_reviews":
-                conn = sqlite3.connect(database.DB_NAME)
-                cursor = conn.cursor()
-                cursor.execute("SELECT AVG(rating), COUNT(*) FROM reviews WHERE shop_id = ?", (shop_id,))
-                result = cursor.fetchone()
-                avg_rating = float(result[0] or 0)
-                review_count = result[1] or 0
+            if data == "shop_reviews":
+                shop_bot_states[user_id] = ShopBotState.BROWSING_REVIEWS
+                show_reviews_page(call.message.chat.id, call.message.message_id, 0)
+                
+            elif data.startswith("reviews_next_"):
+                page = int(data.split("_")[-1])
+                show_reviews_page(call.message.chat.id, call.message.message_id, page)
+                
+            elif data.startswith("reviews_prev_"):
+                page = int(data.split("_")[-1])
+                show_reviews_page(call.message.chat.id, call.message.message_id, page)
 
-                cursor.execute("""
-                    SELECT DISTINCT u.username, r.rating, r.review_text
-                    FROM reviews r
-                    LEFT JOIN users u ON r.user_id = u.tg_id
-                    WHERE r.shop_id = ?
-                    ORDER BY r.created_at DESC
-                    LIMIT 5
-                """, (shop_id,))
-                reviews = cursor.fetchall()
-                conn.close()
-
-                rating_stars = "⭐" * int(avg_rating) if avg_rating > 0 else "Нет оценок"
-
-                review_text = f"📊 Отзывы о магазине\n\n⭐ Средний рейтинг: {rating_stars} ({avg_rating:.1f}/5)\n📝 Количество отзывов: {review_count}\n\nПоследние отзывы:\n"
-                if reviews:
-                    for username, rating, text in reviews:
-                        username = f"@{username}" if username else "Аноним"
-                        stars = "⭐" * rating
-                        review_content = text if text else "Без комментария"
-                        review_text += f"{username}: {stars}\n{review_content}\n\n"
-                else:
-                    review_text += "Отзывов пока нет."
-
+            elif data == "shop_recommendations":
+                # Используем новую улучшенную функцию рекомендаций
+                shops = database.get_similar_shops(shop_id)
+                text = "✨ Рекомендуемые магазины\n(подобранные специально для вас):\n\n"
                 markup = telebot.types.InlineKeyboardMarkup()
-                markup.add(telebot.types.InlineKeyboardButton("💬 Оставить отзыв", callback_data="shop_leave_review"))
+                
+                if not shops:
+                    text += "К сожалению, пока нет рекомендаций."
+                
+                for s_id, name, username, rating, score, price_diff in shops:
+                    stars = "⭐" * int(rating)
+                    # Можно добавить инфо, почему рекомендовано
+                    reason = ""
+                    if score > 5: reason = "🔥 (Похожий выбор)"
+                    elif score > 2: reason = "✅ (Схожие товары)"
+                    
+                    text += f"{name} {stars} {rating:.1f} {reason}\n"
+                    if username:
+                        markup.add(telebot.types.InlineKeyboardButton(f"Перейти в {name}", url=f"https://t.me/{username}"))
+                
                 markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
-
-                shop_bot.edit_message_text(
-                    review_text,
-                    call.message.chat.id,
-                    call.message.message_id,
-                    reply_markup=markup
-                )
+                shop_bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
             elif data == "shop_leave_review":
                 conn = sqlite3.connect(database.DB_NAME)
@@ -660,18 +686,6 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
                 shop_bot_states[f"{user_id}_current_title"] = "Результаты поиска"
                 shop_bot_states[f"{user_id}_current_back"] = "search_filters"
                 show_products_list(call, results, "Результаты поиска", "search_filters")
-
-            elif data == "shop_recommendations":
-                shops = database.get_similar_shops(shop_id)
-                text = "✨ Похожие магазины:\n\n"
-                markup = telebot.types.InlineKeyboardMarkup()
-                for s_id, name, username, rating in shops:
-                    stars = "⭐" * int(rating)
-                    text += f"{name} {stars} ({rating:.1f})\n"
-                    if username:
-                        markup.add(telebot.types.InlineKeyboardButton(f"Посетить магазин {username}", url=f"https://t.me/{username}"))
-                markup.add(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
-                shop_bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
 
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 400 and 'message is not modified' in str(e):
@@ -870,6 +884,7 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
     @shop_bot.pre_checkout_query_handler(lambda query: True)
     def pre_checkout_query(pre_checkout_q: types.PreCheckoutQuery):
         shop_bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+        
         
     try:
         shop_bot.infinity_polling()

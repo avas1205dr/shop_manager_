@@ -21,6 +21,12 @@ class UserState:
     EDITING_CATEGORY_NAME = "editing_category_name"
     DELETING_CATEGORY = "deleting_category"
     EDITING_PAYMASTER = "editing_paymaster"
+    BROADCAST_MESSAGE = "broadcast_message"
+    
+    # Новые состояния для промокодов
+    MANAGE_PROMOCODES = "manage_promocodes"
+    ADDING_PROMO_CODE = "adding_promo_code"       # Ввод самого кода (текст)
+    ADDING_PROMO_VALUE = "adding_promo_value"     # Ввод размера скидки
 
 class ShopBotState:
     MAIN_MENU = "main_menu"
@@ -39,3 +45,7 @@ class ShopBotState:
     FILTER_MIN_PRICE = "filter_min_price"
     FILTER_MAX_PRICE = "filter_max_price"
     ENTERING_QUANTITY = "entering_quantity"
+    BROWSING_REVIEWS = "browsing_reviews"
+    
+    # Новое состояние для ввода промокода покупателем
+    ENTERING_PROMOCODE = "entering_promocode"

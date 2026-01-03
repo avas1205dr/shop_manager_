@@ -1,4 +1,4 @@
 /.env
-/product_images
+product_images/
 shop_manager.db
-/__pycache__
+__pycache__/

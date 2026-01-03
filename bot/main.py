@@ -4,6 +4,7 @@ import logging
 import os
 import uuid
 import sqlite3
+import time
 
 import database as database
 import keyboards as keyboards
@@ -362,6 +363,118 @@ def save_payment_credentials(message):
         message.chat.id,
         "✅ Настройки ЮKassa сохранены!",
         reply_markup=keyboards.create_shop_management_menu(shop_id))
+    user_states[user_id] = UserState.SHOP_MENU
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("broadcast_"))
+def broadcast_menu_handler(call):
+    shop_id = int(call.data.split("_")[-1])
+
+    user_states[call.from_user.id] = UserState.BROADCAST_MESSAGE
+    user_states[f"{call.from_user.id}_shop_id"] = shop_id
+    
+    count = len(database.get_shop_user_ids(shop_id))
+    
+    bot.edit_message_text(
+        f"📢 Рассылка сообщений\n\nПодписчиков бота: {count}\n\n"
+        "Отправьте сообщение (текст, фото или видео), которое хотите разослать всем пользователям вашего бота.\n"
+        "Отправьте 'назад' для отмены.",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboards.create_back_button_menu(f"manage_shop_{shop_id}")
+    )
+
+@bot.message_handler(content_types=['text', 'photo', 'video', 'document'], 
+                     func=lambda message: user_states.get(message.from_user.id) == UserState.BROADCAST_MESSAGE)
+def execute_broadcast(message):
+    user_id = message.from_user.id
+    shop_id = user_states.get(f"{user_id}_shop_id")
+    
+    if message.text and message.text.lower() == 'назад':
+        user_states[user_id] = UserState.SHOP_MENU
+        bot.send_message(message.chat.id, "Рассылка отменена", 
+                        reply_markup=keyboards.create_shop_management_menu(shop_id))
+        return
+
+    if shop_id not in active_shop_bots:
+        bot.send_message(message.chat.id, "❌ Бот магазина не запущен. Проверьте токен.")
+        return
+        
+    shop_bot_instance = active_shop_bots[shop_id]
+    users = database.get_shop_user_ids(shop_id)
+    
+    if not users:
+        bot.send_message(message.chat.id, "❌ Нет пользователей для рассылки.")
+        return
+
+    bot.send_message(message.chat.id, f"🚀 Начинаю рассылку для {len(users)} пользователей...")
+    
+    def send_broadcast_thread():
+        success_count = 0
+        fail_count = 0
+        cached_photo_id = None
+        cached_video_id = None
+        cached_document_id = None
+        file_data = None
+        
+        try:
+            if message.content_type == 'photo':
+                file_info = bot.get_file(message.photo[-1].file_id)
+                file_data = bot.download_file(file_info.file_path)
+            elif message.content_type == 'video':
+                file_info = bot.get_file(message.video.file_id)
+                file_data = bot.download_file(file_info.file_path)
+            elif message.content_type == 'document':
+                file_info = bot.get_file(message.document.file_id)
+                file_data = bot.download_file(file_info.file_path)
+        except Exception as e:
+            logging.error(f"Error downloading file from manager bot: {e}")
+            bot.send_message(user_id, "❌ Ошибка при скачивании файла для рассылки.")
+            return
+
+        for uid in users:
+            try:
+                sent_msg = None
+                if message.content_type == 'photo':
+                    if cached_photo_id:
+                        shop_bot_instance.send_photo(uid, cached_photo_id, caption=message.caption)
+                    else:
+                        sent_msg = shop_bot_instance.send_photo(uid, file_data, caption=message.caption)
+                        cached_photo_id = sent_msg.photo[-1].file_id
+
+                elif message.content_type == 'video':
+                    if cached_video_id:
+                        shop_bot_instance.send_video(uid, cached_video_id, caption=message.caption)
+                    else:
+                        sent_msg = shop_bot_instance.send_video(uid, file_data, caption=message.caption)
+                        cached_video_id = sent_msg.video.file_id
+
+                elif message.content_type == 'document':
+                    if cached_document_id:
+                        shop_bot_instance.send_document(uid, cached_document_id, caption=message.caption)
+                    else:
+                        sent_msg = shop_bot_instance.send_document(uid, file_data, caption=message.caption)
+                        cached_document_id = sent_msg.document.file_id
+
+                elif message.content_type == 'text':
+                    shop_bot_instance.send_message(uid, message.text)
+                
+                success_count += 1
+                time.sleep(0.05) 
+            except Exception as e:
+                logging.error(f"Failed to send broadcast to {uid}: {e}")
+                fail_count += 1
+        
+        try:
+            bot.send_message(user_id, 
+                             f"✅ Рассылка завершена!\n"
+                             f"Успешно: {success_count}\n"
+                             f"Ошибок (блокировок): {fail_count}",
+                             reply_markup=keyboards.create_shop_management_menu(shop_id))
+        except:
+            pass
+            
+    threading.Thread(target=send_broadcast_thread, daemon=True).start()
+    
     user_states[user_id] = UserState.SHOP_MENU
 
 @bot.callback_query_handler(func=lambda call: True)

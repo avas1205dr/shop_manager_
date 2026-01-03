@@ -124,6 +124,16 @@ def init_database():
     JOIN categories c2 ON c2.shop_id = s2.id AND c1.name = c2.name
     GROUP BY s1.id, s2.id
     ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS shop_users (
+        shop_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL, -- Telegram ID пользователя
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (shop_id, user_id),
+        FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE
+    )
+    ''')
     conn.commit()
     
     cursor.execute("PRAGMA table_info(shops)")
@@ -142,6 +152,7 @@ def init_database():
     if 'description' not in columns:
         cursor.execute("ALTER TABLE products ADD COLUMN description TEXT")
     
+    cursor.execute("DROP VIEW IF EXISTS shop_similarity")
     conn.commit()
     conn.close()
 
@@ -187,19 +198,64 @@ def search_products(shop_id, query=None, search_type='name', price_min=None, pri
 def get_similar_shops(shop_id, limit=5):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+
     cursor.execute("""
-    SELECT s.id, s.shop_name, s.bot_username, 
-           COALESCE(AVG(r.rating), 0) AS avg_rating
-    FROM shop_similarity sim
-    JOIN shops s ON sim.similar_shop = s.id
+        SELECT AVG(price) FROM products p
+        JOIN categories c ON p.category_id = c.id
+        WHERE c.shop_id = ?
+    """, (shop_id,))
+    res = cursor.fetchone()
+    current_avg_price = res[0] if res and res[0] else 0
+
+    query = """
+    SELECT 
+        s.id, 
+        s.shop_name, 
+        s.bot_username, 
+        COALESCE(AVG(r.rating), 0) AS avg_rating,
+        (
+            -- Фактор 1: Пересечение покупателей (Orders overlap)
+            (SELECT COUNT(DISTINCT o2.customer_user_id) 
+             FROM orders o1 
+             JOIN orders o2 ON o1.customer_user_id = o2.customer_user_id 
+             WHERE o1.shop_id = ? AND o2.shop_id = s.id) * 3
+             +
+            -- Фактор 2: Пересечение категорий (Category overlap)
+            (SELECT COUNT(*) 
+             FROM categories c1 
+             JOIN categories c2 ON c1.name = c2.name 
+             WHERE c1.shop_id = ? AND c2.shop_id = s.id) * 2
+        ) as similarity_score,
+        -- Фактор 3: Средняя цена (для сортировки, если score одинаковый)
+        ABS(IFNULL((SELECT AVG(price) FROM products p2 JOIN categories c3 ON p2.category_id = c3.id WHERE c3.shop_id = s.id), 0) - ?) as price_diff
+    FROM shops s
     LEFT JOIN reviews r ON s.id = r.shop_id
-    WHERE sim.source_shop = ?
+    WHERE s.id != ? AND s.is_running = 1
     GROUP BY s.id
-    ORDER BY sim.common_categories DESC, avg_rating DESC
+    HAVING similarity_score > 0 OR price_diff < 1000 -- Показывать хоть немного похожие
+    ORDER BY similarity_score DESC, avg_rating DESC, price_diff ASC
     LIMIT ?
-    """, (shop_id, limit))
+    """
+    
+    cursor.execute(query, (shop_id, shop_id, current_avg_price, shop_id, limit))
     shops = cursor.fetchall()
     conn.close()
+
+    if not shops:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT s.id, s.shop_name, s.bot_username, COALESCE(AVG(r.rating), 0) as rating, 0, 0
+            FROM shops s
+            LEFT JOIN reviews r ON s.id = r.shop_id
+            WHERE s.id != ? AND s.is_running = 1
+            GROUP BY s.id
+            ORDER BY rating DESC
+            LIMIT ?
+        """, (shop_id, limit))
+        shops = cursor.fetchall()
+        conn.close()
+        
     return shops
 
 def get_user_shops(user_id):
@@ -806,3 +862,46 @@ def get_paymaster_token_by_shop_id(shop_id):
     res = cursor.fetchone()
     conn.close()
     return res[0] if res else None
+
+def register_shop_user(shop_id, user_id):
+    """Регистрирует пользователя, нажавшего /start в конкретном магазине"""
+    if not isinstance(shop_id, int) or not isinstance(user_id, int):
+        return
+    with db_lock:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO shop_users (shop_id, user_id) VALUES (?, ?)", (shop_id, user_id))
+        conn.commit()
+        conn.close()
+        
+def get_shop_user_ids(shop_id):
+    """Получает всех пользователей магазина для рассылки"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM shop_users WHERE shop_id = ?", (shop_id,))
+    users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return users
+
+def get_shop_reviews(shop_id, page=0, per_page=5):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    offset = page * per_page
+    cursor.execute("""
+        SELECT u.username, r.rating, r.review_text, r.created_at
+        FROM reviews r
+        LEFT JOIN users u ON r.user_id = u.tg_id
+        WHERE r.shop_id = ?
+        ORDER BY r.created_at DESC
+        LIMIT ? OFFSET ?
+    """, (shop_id, per_page, offset))
+    
+    reviews = cursor.fetchall()
+    
+    # Получаем общее количество для пагинации
+    cursor.execute("SELECT COUNT(*) FROM reviews WHERE shop_id = ?", (shop_id,))
+    total_count = cursor.fetchone()[0]
+    
+    conn.close()
+    return reviews, total_count
