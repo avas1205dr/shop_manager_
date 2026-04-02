@@ -73,8 +73,14 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         description = product[3]
         price = product[4]
         image_path = product[5]
-        
-        caption = f"📱 Артикул: {prod_id}\n📦 {name}\n💰 {price} RUB\n📝 {description or 'Нет описания'}"
+
+        display_price, orig_price, has_sale = database.get_product_display_price(product)
+        if has_sale:
+            price_line = f"~~{orig_price}₽~~ 🔥 {display_price}₽"
+        else:
+            price_line = f"{display_price}₽"
+
+        caption = f"📱 Артикул: {prod_id}\n📦 {name}\n💰 {price_line}\n📝 {description or 'Нет описания'}"
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(telebot.types.InlineKeyboardButton("👛 Заказать", callback_data=f"buy_product_{prod_id}"))
         markup.add(telebot.types.InlineKeyboardButton("🛒 Добавить в корзину", callback_data=f"add_to_cart_{prod_id}"))
@@ -137,14 +143,29 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         order_ids = []
         total_price = 0
         order_details = ""
-        
+
         for product_id, name, price, quantity in items:
             total_price += price * quantity
             order_details += f"📦 {name} x{quantity} - {price * quantity}₽\n"
+
+        # Применяем промокод если есть
+        promo = shop_bot_states.get(f"{customer_id}_promo")
+        original_price = total_price
+        if promo:
+            if promo['discount_type'] == 'percent':
+                total_price = round(total_price * (1 - promo['discount_value'] / 100), 2)
+            else:
+                total_price = max(0, round(total_price - promo['discount_value'], 2))
+            saved = round(original_price - total_price, 2)
+            order_details += f"\n🎟️ Промокод {promo['code']}: скидка {saved:.0f}₽"
+            database.use_promocode(promo['id'])
+            shop_bot_states.pop(f"{customer_id}_promo", None)
+
+        for product_id, name, price, quantity in items:
             cursor.execute("INSERT INTO orders (shop_id, customer_user_id, product_id, total_price, delivery_address) VALUES (?, ?, ?, ?, ?)",
                          (shop_id, customer_id, product_id, total_price, delivery_address))
             order_ids.append(cursor.lastrowid)
-        
+
         conn.commit()
         conn.close()
         
@@ -263,6 +284,18 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
                     )
 
                 cart_text += f"\n💰 Итог: {total_price}₽"
+                # Показываем применённый промокод
+                promo = shop_bot_states.get(f"{user_id}_promo")
+                if promo:
+                    disc = f"-{int(promo['discount_value'])}%" if promo['discount_type'] == 'percent' else f"-{int(promo['discount_value'])}₽"
+                    if promo['discount_type'] == 'percent':
+                        discounted = total_price * (1 - promo['discount_value'] / 100)
+                    else:
+                        discounted = max(0, total_price - promo['discount_value'])
+                    cart_text += "\n🎟️ Промокод <b>" + promo['code'] + "</b>: " + disc + "\n"
+                    markup.row(telebot.types.InlineKeyboardButton("❌ Убрать промокод", callback_data="remove_promo"))
+                else:
+                    markup.row(telebot.types.InlineKeyboardButton("🎟️ Ввести промокод", callback_data="enter_promo"))
                 markup.row(
                     telebot.types.InlineKeyboardButton("✅ Оформить заказ", callback_data="order_cart"),
                     telebot.types.InlineKeyboardButton("🗑️ Очистить корзину", callback_data="clear_cart")
@@ -273,7 +306,8 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
                     cart_text,
                     call.message.chat.id,
                     call.message.message_id,
-                    reply_markup=markup
+                    reply_markup=markup,
+                    parse_mode="HTML"
                 )
 
             elif data.startswith("increase_cart_"):
@@ -687,6 +721,45 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
                 shop_bot_states[f"{user_id}_current_back"] = "search_filters"
                 show_products_list(call, results, "Результаты поиска", "search_filters")
 
+            elif data == "enter_promo":
+                shop_bot_states[user_id] = ShopBotState.ENTERING_PROMOCODE
+                shop_bot.edit_message_text(
+                    "🎟️ Введите промокод:",
+                    call.message.chat.id,
+                    call.message.message_id,
+                    reply_markup=keyboards.create_back_button_menu("view_cart")
+                )
+
+            elif data == "remove_promo":
+                shop_bot_states.pop(f"{user_id}_promo", None)
+                shop_bot.answer_callback_query(call.id, "Промокод убран")
+                # Refresh cart
+                items = database.get_cart_items(shop_id, user_id)
+                if not items:
+                    shop_bot.edit_message_text("🛒 Ваша корзина пуста", call.message.chat.id, call.message.message_id, reply_markup=create_shop_main_menu())
+                    return
+                total_price = 0
+                cart_text = "🛒 Ваша корзина:\n\n"
+                markup = telebot.types.InlineKeyboardMarkup(row_width=4)
+                for product_id, name, price, quantity in items:
+                    item_total = price * quantity
+                    total_price += item_total
+                    cart_text += f"📦 {name}\n   Цена: {price}₽ x {quantity} = {item_total}₽\n"
+                    markup.row(
+                        telebot.types.InlineKeyboardButton(f"❌ {name}", callback_data=f"remove_from_cart_{product_id}"),
+                        telebot.types.InlineKeyboardButton("➖", callback_data=f"decrease_cart_{product_id}"),
+                        telebot.types.InlineKeyboardButton(f"{quantity}", callback_data=f"change_quantity_{product_id}"),
+                        telebot.types.InlineKeyboardButton("➕", callback_data=f"increase_cart_{product_id}")
+                    )
+                cart_text += f"\n💰 Итог: {total_price}₽"
+                markup.row(telebot.types.InlineKeyboardButton("🎟️ Ввести промокод", callback_data="enter_promo"))
+                markup.row(
+                    telebot.types.InlineKeyboardButton("✅ Оформить заказ", callback_data="order_cart"),
+                    telebot.types.InlineKeyboardButton("🗑️ Очистить корзину", callback_data="clear_cart")
+                )
+                markup.row(telebot.types.InlineKeyboardButton("⬅️ Назад", callback_data="shop_main_menu"))
+                shop_bot.edit_message_text(cart_text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 400 and 'message is not modified' in str(e):
                 pass
@@ -696,6 +769,30 @@ def run_shop_bot(shop_id, bot_token, welcome_message):
         except Exception as e:
             logging.error(f"Shop callback error: {str(e)}")
             shop_bot.answer_callback_query(call.id, f"Ошибка: {str(e)[:100]}")
+
+    @shop_bot.message_handler(func=lambda message: shop_bot_states.get(message.from_user.id) == ShopBotState.ENTERING_PROMOCODE)
+    def handle_promocode_input(message):
+        user_id = message.from_user.id
+        code = message.text.strip()
+        if code.lower() == 'назад':
+            shop_bot_states[user_id] = ShopBotState.VIEWING_CART
+            shop_bot.send_message(message.chat.id, "Отмена ввода промокода.",
+                                  reply_markup=keyboards.create_back_button_menu("view_cart"))
+            return
+        promo = database.validate_promocode(shop_id, code)
+        if not promo:
+            shop_bot.send_message(message.chat.id,
+                "❌ Промокод не найден или недействителен. Попробуйте ещё раз или отправьте 'назад':")
+            return
+        shop_bot_states[f"{user_id}_promo"] = promo
+        shop_bot_states[user_id] = ShopBotState.VIEWING_CART
+        disc_str = f"-{int(promo['discount_value'])}%" if promo['discount_type'] == 'percent' else f"-{int(promo['discount_value'])}₽"
+        shop_bot.send_message(
+            message.chat.id,
+            "✅ Промокод <b>" + promo['code'] + "</b> применён! Скидка: " + disc_str + "\n\nВернитесь в корзину для оформления.",
+            parse_mode="HTML",
+            reply_markup=keyboards.create_back_button_menu("view_cart")
+        )
 
     @shop_bot.message_handler(func=lambda message: shop_bot_states.get(message.from_user.id) == ShopBotState.ENTERING_ADDRESS)
     def handle_cart_delivery_address(message):

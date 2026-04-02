@@ -57,13 +57,14 @@ def create_shop_management_menu(shop_id):
     btn_orders = types.InlineKeyboardButton("📋 Заказы", callback_data=f"view_orders_{shop_id}")
     btn_workers = types.InlineKeyboardButton("👥 Работники", callback_data=f"workers_{shop_id}")
     btn_broadcast = types.InlineKeyboardButton("📢 Рассылка", callback_data=f"broadcast_{shop_id}") # НОВАЯ КНОПКА
+    btn_promo = types.InlineKeyboardButton("🎟️ Промокоды", callback_data=f"manage_promocodes_{shop_id}")
     btn_delete = types.InlineKeyboardButton("🗑️ Удалить магазин", callback_data=f"delete_shop_{shop_id}")
     btn_back = types.InlineKeyboardButton("⬅️ Назад", callback_data="my_shops")
     
     markup.add(btn_token, btn_paymaster)
     markup.add(btn_products, btn_all_products)
     markup.add(btn_workers, btn_orders)
-    markup.add(btn_broadcast)
+    markup.add(btn_broadcast, btn_promo)
     btn_payment = types.InlineKeyboardButton("💳 Способ оплаты", callback_data=f"payment_method_{shop_id}")
     btn_welcome = types.InlineKeyboardButton("👋 Приветствие", callback_data=f"edit_welcome_{shop_id}")
     markup.add(btn_payment, btn_welcome)
@@ -198,6 +199,8 @@ def create_edit_product_menu(product_id, category_id, page=0):
               callback_data=f"edit_photo_{product_id}_{category_id}_{page}"))
     markup.add(types.InlineKeyboardButton("👁️ Показать товар", 
               callback_data=f"show_product_{product_id}_{category_id}_{page}"))
+    markup.add(types.InlineKeyboardButton("🏷️ Скидка на товар", 
+              callback_data=f"edit_sale_{product_id}_{category_id}_{page}"))
     markup.add(types.InlineKeyboardButton("🗑️ Удалить товар", 
               callback_data=f"delete_product_{product_id}_{category_id}_{page}"))
     markup.add(types.InlineKeyboardButton("🔙 Назад", 
@@ -207,4 +210,26 @@ def create_edit_product_menu(product_id, category_id, page=0):
 def create_back_button_menu(target_callback):
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=target_callback))
+    return markup
+
+def create_promocodes_menu(shop_id, promos):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for promo_id, code, dtype, dvalue, max_uses, uses_count, is_active in promos:
+        label = f"{code} — {'−' + str(int(dvalue)) + '%' if dtype == 'percent' else '−' + str(int(dvalue)) + '₽'}"
+        uses_label = f"{uses_count}/{max_uses}" if max_uses else str(uses_count)
+        markup.add(types.InlineKeyboardButton(
+            f"{label}  ({uses_label} исп.)",
+            callback_data=f"delete_promo_{promo_id}_{shop_id}"
+        ))
+    markup.add(types.InlineKeyboardButton("➕ Создать промокод", callback_data=f"add_promocode_{shop_id}"))
+    markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"manage_shop_{shop_id}"))
+    return markup
+
+def create_promo_type_menu(shop_id):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("% Процент", callback_data=f"promo_type_percent_{shop_id}"),
+        types.InlineKeyboardButton("₽ Фиксированная", callback_data=f"promo_type_fixed_{shop_id}")
+    )
+    markup.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"manage_promocodes_{shop_id}"))
     return markup

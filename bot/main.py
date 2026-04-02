@@ -477,6 +477,102 @@ def execute_broadcast(message):
     
     user_states[user_id] = UserState.SHOP_MENU
 
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id) == UserState.ADDING_PROMO_CODE)
+def handle_promo_code_input(message):
+    user_id = message.from_user.id
+    shop_id = user_states.get(f"{user_id}_shop_id")
+    text = message.text.strip()
+
+    if text.lower() == "назад":
+        user_states[user_id] = UserState.SHOP_MENU
+        promos = database.get_shop_promocodes(shop_id)
+        header = "🎟️ Промокоды магазина\n\nНажмите на промокод — он удалится." if promos else "🎟️ Промокодов пока нет."
+        bot.send_message(message.chat.id, header,
+                         reply_markup=keyboards.create_promocodes_menu(shop_id, promos))
+        return
+
+    code = text.upper()
+    if len(code) < 2 or len(code) > 20:
+        bot.send_message(message.chat.id, "❌ Код должен быть от 2 до 20 символов. Попробуйте снова:")
+        return
+
+    user_states[f"{user_id}_promo_code"] = code
+    bot.send_message(
+        message.chat.id,
+        f"Код: <b>{code}</b>\n\nШаг 2/3: Выберите тип скидки:",
+        parse_mode="HTML",
+        reply_markup=keyboards.create_promo_type_menu(shop_id)
+    )
+    # Остаёмся в ADDING_PROMO_CODE — следующий шаг через кнопку
+
+
+@bot.message_handler(func=lambda message: user_states.get(message.from_user.id) == UserState.ADDING_PROMO_VALUE)
+def handle_promo_value_input(message):
+    user_id = message.from_user.id
+    shop_id = user_states.get(f"{user_id}_shop_id")
+    text = message.text.strip()
+
+    if text.lower() == "назад":
+        user_states[user_id] = UserState.ADDING_PROMO_CODE
+        bot.send_message(message.chat.id, "Введите текст промокода:",
+                         reply_markup=keyboards.create_back_button_menu(f"manage_promocodes_{shop_id}"))
+        return
+
+    try:
+        value = float(text)
+        dtype = user_states.get(f"{user_id}_promo_type", "percent")
+        if value <= 0 or (dtype == "percent" and value > 100):
+            raise ValueError()
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Некорректное значение. Введите положительное число:")
+        return
+
+    code = user_states.get(f"{user_id}_promo_code")
+    dtype = user_states.get(f"{user_id}_promo_type", "percent")
+    ok = database.create_promocode(shop_id, code, dtype, value)
+
+    if not ok:
+        bot.send_message(message.chat.id, f"❌ Промокод {code} уже существует. Попробуйте другой код:")
+        user_states[user_id] = UserState.SHOP_MENU
+        return
+
+    discount_str = f"-{int(value)}%" if dtype == "percent" else f"-{int(value)}₽"
+    promos = database.get_shop_promocodes(shop_id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Промокод <b>{code}</b> ({discount_str}) создан!",
+        parse_mode="HTML",
+        reply_markup=keyboards.create_promocodes_menu(shop_id, promos)
+    )
+    user_states[user_id] = UserState.SHOP_MENU
+
+    # Авто-рассылка через бот магазина
+    if shop_id in active_shop_bots:
+        shop_info = database.get_shop_info(shop_id)
+        shop_name = shop_info[2] if shop_info else "магазин"
+        users = database.get_shop_user_ids(shop_id)
+        if users:
+            promo_msg = (
+                "🎉 Акция в магазине <b>" + shop_name + "</b>!\n\n"
+                "🎟️ Промокод: <b>" + code + "</b>\n"
+                "💸 Скидка: <b>" + discount_str + "</b>\n\n"
+                "Введите промокод при оформлении заказа!"
+            )
+            shop_bot_instance = active_shop_bots[shop_id]
+
+            def _broadcast_promo(bot_inst=shop_bot_instance, msg=promo_msg, uid_list=users):
+                for uid in uid_list:
+                    try:
+                        bot_inst.send_message(uid, msg, parse_mode="HTML")
+                        time.sleep(0.05)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_broadcast_promo, daemon=True).start()
+            bot.send_message(message.chat.id,
+                             f"📢 Рассылка акции запущена для {len(users)} пользователей.")
+
+
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     user_id = call.from_user.id
@@ -944,7 +1040,7 @@ def callback_handler(call):
                 call.message.message_id,
                 reply_markup=keyboards.create_products_menu(category_id, page))
         
-        elif data.startswith("edit_name_") or data.startswith("edit_price_") or data.startswith("edit_desc_") or data.startswith("edit_photo_"):
+        elif data.startswith("edit_name_") or data.startswith("edit_price_") or data.startswith("edit_desc_") or data.startswith("edit_photo_") or data.startswith("edit_sale_"):
             parts = data.split("_")
             if len(parts) < 5:
                 bot.answer_callback_query(call.id, "Неверные данные")
@@ -959,11 +1055,14 @@ def callback_handler(call):
             user_states[f"{user_id}_category_id"] = category_id
             user_states[f"{user_id}_page"] = page
             
+            product_info = database.get_product_info(int(user_states.get(f"{user_id}_product_id", 0) or 0))
+            sale_hint = f"Текущая: {product_info[4]}₽" if product_info else ""
             prompt = {
                 "name": "Введите новое название (мин 2 символа):\n\nОтправьте 'назад' для отмены",
                 "price": "Введите новую цену (положительное число):\n\nОтправьте 'назад' для отмены",
                 "desc": "Введите новое описание:\n\nОтправьте 'назад' для отмены",
-                "photo": "Отправьте новое фото или текст 'пропустить'/'стандартное':\n\nОтправьте 'назад' для отмены"
+                "photo": "Отправьте новое фото или текст 'пропустить'/'стандартное':\n\nОтправьте 'назад' для отмены",
+                "sale": f"💸 Акционная цена ({sale_hint})\n\nВведите новую цену меньше обычной.\nЧтобы убрать скидку — отправьте '-'\n\nОтправьте 'назад' для отмены"
             }[edit_type]
             
             try:
@@ -1033,7 +1132,59 @@ def callback_handler(call):
                 call.message.message_id,
                 reply_markup=markup
             )
-            
+
+        # ─── ПРОМОКОДЫ ───────────────────────────────────────────────────
+        elif data.startswith("manage_promocodes_"):
+            shop_id = int(data.split("_")[-1])
+            promos = database.get_shop_promocodes(shop_id)
+            header = "🎟️ Промокоды магазина\n\nНажмите на промокод — он удалится." if promos else "🎟️ Промокодов пока нет."
+            bot.edit_message_text(
+                header,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboards.create_promocodes_menu(shop_id, promos)
+            )
+
+        elif data.startswith("add_promocode_"):
+            shop_id = int(data.split("_")[-1])
+            user_states[user_id] = UserState.ADDING_PROMO_CODE
+            user_states[f"{user_id}_shop_id"] = shop_id
+            bot.edit_message_text(
+                "🎟️ Создание промокода\n\nШаг 1/3: Введите текст кода (например SALE20):\n\nОтправьте 'назад' для отмены",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboards.create_back_button_menu(f"manage_promocodes_{shop_id}")
+            )
+
+        elif data.startswith("promo_type_percent_") or data.startswith("promo_type_fixed_"):
+            parts = data.split("_")
+            shop_id = int(parts[-1])
+            dtype = "percent" if "percent" in data else "fixed"
+            user_states[f"{user_id}_promo_type"] = dtype
+            user_states[user_id] = UserState.ADDING_PROMO_VALUE
+            hint = "(0–100, например 15 = скидка 15%)" if dtype == "percent" else "(в рублях, например 200 = скидка 200₽)"
+            bot.edit_message_text(
+                f"Шаг 3/3: Введите размер скидки {hint}:\n\nОтправьте 'назад' для отмены",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboards.create_back_button_menu(f"manage_promocodes_{shop_id}")
+            )
+
+        elif data.startswith("delete_promo_"):
+            parts = data.split("_")
+            promo_id = int(parts[2])
+            shop_id = int(parts[3])
+            database.deactivate_promocode(promo_id)
+            bot.answer_callback_query(call.id, "✅ Промокод удалён")
+            promos = database.get_shop_promocodes(shop_id)
+            header = "🎟️ Промокоды магазина\n\nНажмите на промокод — он удалится." if promos else "🎟️ Промокодов пока нет."
+            bot.edit_message_text(
+                header,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=keyboards.create_promocodes_menu(shop_id, promos)
+            )
+
     except telebot.apihelper.ApiTelegramException as e:
         if e.error_code == 400 and 'message is not modified' in str(e):
             pass
@@ -1460,6 +1611,30 @@ def text_handler(message):
                 bot.send_message(message.chat.id, "❌ Некорректная опция. Отправьте фото, 'Пропустить', 'Стандартное' или 'назад'")
                 return
             
+            bot.send_message(
+                message.chat.id,
+                "📦 Товары в разделе:",
+                reply_markup=keyboards.create_products_menu(category_id, page))
+
+        elif edit_type == "sale":
+            text = message.text.strip().lower()
+            if text in ("-", "убрать", "нет", "0"):
+                database.set_product_sale_price(product_id, None)
+                bot.send_message(message.chat.id, "✅ Акционная цена убрана!")
+            else:
+                try:
+                    sale_price = float(text)
+                    if sale_price <= 0:
+                        raise ValueError()
+                    product = database.get_product_info(product_id)
+                    if product and sale_price >= product[4]:
+                        bot.send_message(message.chat.id, f"❌ Акционная цена должна быть меньше обычной ({product[4]}₽). Попробуйте снова или 'назад':")
+                        return
+                    database.set_product_sale_price(product_id, sale_price)
+                    bot.send_message(message.chat.id, f"✅ Акционная цена {sale_price}₽ установлена!")
+                except ValueError:
+                    bot.send_message(message.chat.id, "❌ Введите число (цену) или '-' чтобы убрать скидку:")
+                    return
             bot.send_message(
                 message.chat.id,
                 "📦 Товары в разделе:",

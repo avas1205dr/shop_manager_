@@ -151,8 +151,27 @@ def init_database():
     columns = [col[1] for col in cursor.fetchall()]
     if 'description' not in columns:
         cursor.execute("ALTER TABLE products ADD COLUMN description TEXT")
+    if 'sale_price' not in columns:
+        cursor.execute("ALTER TABLE products ADD COLUMN sale_price REAL DEFAULT NULL")
     
     cursor.execute("DROP VIEW IF EXISTS shop_similarity")
+    conn.commit()
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS promocodes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shop_id INTEGER NOT NULL,
+        code TEXT NOT NULL,
+        discount_type TEXT NOT NULL CHECK (discount_type IN (\'percent\', \'fixed\')),
+        discount_value REAL NOT NULL,
+        max_uses INTEGER,
+        uses_count INTEGER DEFAULT 0,
+        is_active INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (shop_id, code),
+        FOREIGN KEY (shop_id) REFERENCES shops (id) ON DELETE CASCADE
+    )
+    ''')
     conn.commit()
     conn.close()
 
@@ -905,3 +924,125 @@ def get_shop_reviews(shop_id, page=0, per_page=5):
     
     conn.close()
     return reviews, total_count
+# ─────────────────── ПРОМОКОДЫ ───────────────────
+
+def create_promocode(shop_id, code, discount_type, discount_value, max_uses=None):
+    """Создаёт промокод для магазина. discount_type: 'percent' | 'fixed'"""
+    if not isinstance(shop_id, int) or shop_id <= 0:
+        return False
+    if not code or not isinstance(code, str) or len(code) < 1:
+        return False
+    if discount_type not in ('percent', 'fixed'):
+        return False
+    if not isinstance(discount_value, (int, float)) or discount_value <= 0:
+        return False
+    code = code.upper().strip()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO promocodes (shop_id, code, discount_type, discount_value, max_uses) VALUES (?, ?, ?, ?, ?)",
+            (shop_id, code, discount_type, discount_value, max_uses)
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False  # код уже существует
+    finally:
+        conn.close()
+
+def get_shop_promocodes(shop_id):
+    """Возвращает все промокоды магазина."""
+    if not isinstance(shop_id, int) or shop_id <= 0:
+        return []
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, code, discount_type, discount_value, max_uses, uses_count, is_active FROM promocodes WHERE shop_id = ? ORDER BY created_at DESC",
+        (shop_id,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def validate_promocode(shop_id, code):
+    """
+    Проверяет промокод для магазина.
+    Возвращает dict с данными промокода или None если невалиден.
+    """
+    if not isinstance(shop_id, int) or not code:
+        return None
+    code = code.upper().strip()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, code, discount_type, discount_value, max_uses, uses_count FROM promocodes "
+        "WHERE shop_id = ? AND code = ? AND is_active = 1",
+        (shop_id, code)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    promo_id, code_, dtype, dvalue, max_uses, uses_count = row
+    if max_uses is not None and uses_count >= max_uses:
+        return None  # исчерпан лимит
+    return {
+        'id': promo_id,
+        'code': code_,
+        'discount_type': dtype,
+        'discount_value': dvalue,
+        'max_uses': max_uses,
+        'uses_count': uses_count,
+    }
+
+def use_promocode(promo_id):
+    """Увеличивает счётчик использований промокода."""
+    if not isinstance(promo_id, int) or promo_id <= 0:
+        return
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE promocodes SET uses_count = uses_count + 1 WHERE id = ?", (promo_id,))
+    conn.commit()
+    conn.close()
+
+def deactivate_promocode(promo_id):
+    """Деактивирует (удаляет) промокод."""
+    if not isinstance(promo_id, int) or promo_id <= 0:
+        return False
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM promocodes WHERE id = ?", (promo_id,))
+    conn.commit()
+    conn.close()
+    return True
+def set_product_sale_price(product_id, sale_price):
+    """Устанавливает акционную цену товара. None — убирает скидку."""
+    if not isinstance(product_id, int) or product_id <= 0:
+        return False
+    if sale_price is not None and (not isinstance(sale_price, (int, float)) or sale_price < 0):
+        return False
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    # Добавляем колонку если ещё нет (на случай старой БД)
+    try:
+        cursor.execute("ALTER TABLE products ADD COLUMN sale_price REAL DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        pass
+    cursor.execute("UPDATE products SET sale_price = ? WHERE id = ?", (sale_price, product_id))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_product_display_price(product):
+    """Возвращает (отображаемая_цена, оригинальная_цена, есть_скидка).
+    product — кортеж из get_product_info()."""
+    try:
+        sale_price = product[9] if len(product) > 9 else None
+    except (IndexError, TypeError):
+        sale_price = None
+    original = product[4]
+    if sale_price is not None and 0 < sale_price < original:
+        return sale_price, original, True
+    return original, original, False
