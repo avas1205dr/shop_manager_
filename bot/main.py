@@ -546,7 +546,48 @@ def handle_promo_value_input(message):
     )
     user_states[user_id] = UserState.SHOP_MENU
 
-    # Авто-рассылка через бот магазина
+    # ── Предупреждение о бесплатных товарах ──
+    conn = sqlite3.connect(database.DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT p.id, p.name, p.price, p.sale_price
+        FROM products p
+        JOIN categories c ON p.category_id = c.id
+        WHERE c.shop_id = ?
+    """, (shop_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    free_products = []
+    for prod_id, prod_name, price, sale_price in rows:
+        # Реальная цена — акционная если есть и она меньше базовой
+        if sale_price is not None and 0 < sale_price < price:
+            effective_price = sale_price
+        else:
+            effective_price = price
+
+        if dtype == "percent":
+            final = effective_price * (1 - value / 100)
+        else:
+            final = effective_price - value
+
+        if final < 1.0:
+            label = f"{prod_name} ({effective_price}₽)" if effective_price == price else f"{prod_name} ({price}₽ → {effective_price}₽ по акции)"
+            free_products.append(label)
+
+    if free_products:
+        lines = "\n".join(f"• {label}" for label in free_products)
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ <b>Внимание!</b> С промокодом <b>{code}</b> ({discount_str}) "
+            f"следующие товары станут <b>бесплатными</b> (итоговая цена &lt;1₽):\n\n"
+            f"{lines}\n\n"
+            f"Покупатели смогут получить их без оплаты. "
+            f"Если это не задумано — удалите промокод или поднимите цены на эти товары.",
+            parse_mode="HTML"
+        )
+
+    # ── Авто-рассылка через бот магазина ──
     if shop_id in active_shop_bots:
         shop_info = database.get_shop_info(shop_id)
         shop_name = shop_info[2] if shop_info else "магазин"

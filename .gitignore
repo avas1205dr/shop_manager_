@@ -1,4 +1,6 @@
 /.env
 product_images/
 shop_manager.db
-/__pycache__/
+__pycache__/
+*.cpython-*.pyc
+bot/__pycache__/
