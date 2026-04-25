@@ -1745,10 +1745,12 @@ async def handle_promo_value_input(message: Message):
 
 # ── Универсальный текстовый обработчик ──
 
-# ВАЖНО: исключаем successful_payment, иначе этот catch-all перехватывает
-# сервисное сообщение об успешной оплате раньше, чем @dp.message(F.successful_payment)
-# ниже, и мы не успеваем пометить заказ как PAID и зачислить баланс продавцу.
-@dp.message(~F.successful_payment)
+# ВАЖНО: catch-all регистрируется ВРУЧНУЮ в самом низу файла, ПОСЛЕ всех
+# state-обработчиков (см. dp.message.register(text_handler, ...) ниже). Если
+# повесить @dp.message здесь, в порядке регистрации aiogram catch-all окажется
+# раньше handle_edit_digital_content, handle_edit_digital_ttl,
+# handle_withdraw_amount и т.п. — и съест их сообщения, отправляя
+# пользователя в главное меню («Используйте кнопки меню для навигации»).
 async def text_handler(message: Message):
     user_id    = message.from_user.id
     user_state = user_states.get(user_id)
@@ -2531,6 +2533,14 @@ async def manager_successful_payment(message: Message):
                 await shop_sender.send_message(aid, notify_text, parse_mode=ParseMode.HTML)
             except Exception as e:
                 logger.error(f"shop-bot notify admin {aid} failed for order #{order_id}: {e}")
+
+
+# Регистрируем catch-all text_handler САМЫМ ПОСЛЕДНИМ среди message-хендлеров,
+# чтобы все state-обработчики выше (handle_edit_digital_content,
+# handle_edit_digital_ttl, handle_reply_dispute, handle_withdraw_*, ADD/EDIT
+# промокодов и т.п.) имели приоритет. ~F.successful_payment гарантирует, что
+# сервисное сообщение об оплате уйдёт в manager_successful_payment.
+dp.message.register(text_handler, ~F.successful_payment)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
