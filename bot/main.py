@@ -160,7 +160,19 @@ async def _send_payment_invoice(message: Message, order_id: int) -> None:
         await message.answer("❌ Некорректная сумма заказа.")
         return
     price_kopecks = int(round(total * 100))
-    price_kopecks = max(100, min(price_kopecks, 9_999_900))
+    # Telegram Payments требует минимум 1 RUB и максимум ~99999 RUB.
+    # Раньше мы клампили снизу до 100 копеек, но это рассинхронизировалось
+    # с manager_pre_checkout (он сравнивает с total как есть) и вело к
+    # PAYMENT_AMOUNT_INVALID на копеечных строках корзины. Теперь просто
+    # отказываем в оплате через Telegram, если сумма меньше минимума.
+    if price_kopecks < 100:
+        await message.answer(
+            "❌ Сумма заказа меньше минимально допустимой для онлайн-оплаты "
+            "(1 ₽). Пожалуйста, обратитесь к продавцу."
+        )
+        return
+    if price_kopecks > 9_999_900:
+        price_kopecks = 9_999_900
     title = (order.get("product_name") or "Заказ")[:32]
     desc = (
         f"Заказ #{order_id} в магазине «{order.get('shop_name') or '—'}»\n"

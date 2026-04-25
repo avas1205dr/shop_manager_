@@ -1498,13 +1498,18 @@ async def update_order_status(order_id: int, new_status: str,
                 and old_status != ORDER_STATUS_PAID
                 and not already_paid_once):
             await credit_seller_balance(shop_id, total, source=f"order_paid:{order_id}")
-        # Возврат после оплаты → списываем с продавца обратно. Если оплачено
-        # никогда не было (статус сразу cancel из new) — ничего не делаем.
-        if new_status == ORDER_STATUS_REFUNDED and old_status in (
-            ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING, ORDER_STATUS_SHIPPED,
-            ORDER_STATUS_DELIVERED, ORDER_STATUS_COMPLETED, ORDER_STATUS_DISPUTED,
-            ORDER_STATUS_REFUND_REQUESTED,
-        ):
+        # Возврат после оплаты → списываем с продавца обратно. Если факт оплаты
+        # не был зафиксирован (paid_at is NULL — например, NEW → DISPUTED →
+        # REFUNDED), значит баланс продавцу никогда не зачислялся, и списывать
+        # тоже нечего; иначе бы у продавца уходили деньги, заработанные на
+        # других заказах.
+        if (new_status == ORDER_STATUS_REFUNDED
+                and already_paid_once
+                and old_status in (
+                    ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING, ORDER_STATUS_SHIPPED,
+                    ORDER_STATUS_DELIVERED, ORDER_STATUS_COMPLETED, ORDER_STATUS_DISPUTED,
+                    ORDER_STATUS_REFUND_REQUESTED,
+                )):
             await debit_seller_balance(shop_id, _rub_to_kop(total))
     return True
 
