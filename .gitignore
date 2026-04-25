@@ -1,6 +1,10 @@
 /.env
+.env
+.env.*
+!.env.example
 product_images/
 shop_manager.db
+db/
 __pycache__/
 *.cpython-*.pyc
 bot/__pycache__/

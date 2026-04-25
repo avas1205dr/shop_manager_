@@ -28,6 +28,16 @@ class UserState:
     ADDING_PROMO_CODE = "adding_promo_code"
     ADDING_PROMO_VALUE = "adding_promo_value"
 
+    # Цифровая доставка
+    EDITING_DIGITAL_CONTENT = "editing_digital_content"
+    EDITING_DIGITAL_TTL = "editing_digital_ttl"
+
+    # Споры/возвраты у админа
+    REPLYING_DISPUTE = "replying_dispute"
+
+    # Модерация (главный бот)
+    MOD_REJECT_REASON = "mod_reject_reason"
+
 
 class ShopBotState:
     MAIN_MENU = "main_menu"
@@ -52,3 +62,13 @@ class ShopBotState:
     ENTERING_PROMOCODE = "entering_promocode"
     # Промокод при прямой покупке (кнопка «Заказать»)
     ENTERING_PROMOCODE_DIRECT = "entering_promocode_direct"
+    # Адрес при прямой покупке (физический товар)
+    ENTERING_ADDRESS_DIRECT = "entering_address_direct"
+
+    # Жалоба на магазин
+    COMPLAINT_REASON = "complaint_reason"
+
+    # Спор по заказу / запрос возврата
+    DISPUTE_REASON = "dispute_reason"
+    REFUND_REASON = "refund_reason"
+    DISPUTE_REPLY = "dispute_reply"

@@ -21,8 +21,10 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+import config
 import database
 import keyboards
+import legal
 from states import ShopBotState
 
 PRODUCTS_PER_PAGE = 5
@@ -52,7 +54,14 @@ def _create_shop_main_menu() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="📊 Отзывы", callback_data="shop_reviews"),
         InlineKeyboardButton(text="🔍 Поиск", callback_data="shop_search"),
     )
-    builder.row(InlineKeyboardButton(text="✨ Похожие магазины", callback_data="shop_recommendations"))
+    builder.row(
+        InlineKeyboardButton(text="📋 Мои заказы", callback_data="my_orders"),
+        InlineKeyboardButton(text="✨ Похожие магазины", callback_data="shop_recommendations"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📜 Правила", callback_data="shop_terms"),
+        InlineKeyboardButton(text="🚩 Пожаловаться", callback_data="shop_complain_root"),
+    )
     return builder.as_markup()
 
 
@@ -160,10 +169,52 @@ async def _show_product_detail(chat_id: int, bot: Bot, product_id: int):
         await bot.send_message(chat_id, caption, reply_markup=markup)
 
 
+async def _deliver_digital(order: dict, bot: Bot) -> bool:
+    """Отправляет цифровой контент покупателю и помечает заказ как `delivered`."""
+    digital_kind = order.get("digital_content_kind")
+    digital      = order.get("digital_content")
+    ttl_hours    = order.get("digital_ttl_hours")
+    if not digital:
+        return False
+    payload_for_log = f"[{digital_kind}] {str(digital)[:200]}"
+    text = f"📤 <b>Ваш товар:</b> {order['product_name']}\n"
+    if ttl_hours:
+        text += f"⏰ Срок действия: {ttl_hours} ч с момента оплаты.\n"
+    text += "\n"
+    try:
+        if digital_kind == "photo_id":
+            await bot.send_photo(order['customer_user_id'], digital, caption=text or None,
+                                 parse_mode=ParseMode.HTML)
+        elif digital_kind == "file_id":
+            await bot.send_document(order['customer_user_id'], digital, caption=text or None,
+                                    parse_mode=ParseMode.HTML)
+        elif digital_kind == "url":
+            await bot.send_message(order['customer_user_id'], text + f"🔗 {digital}",
+                                   parse_mode=ParseMode.HTML)
+        else:
+            await bot.send_message(order['customer_user_id'], text + str(digital),
+                                   parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.error(f"Не удалось доставить цифровой контент по заказу {order['id']}: {e}")
+        return False
+    await database.set_order_delivery_payload(order['id'], payload_for_log)
+    await database.update_order_status(order['id'], database.ORDER_STATUS_DELIVERED)
+    return True
+
+
 async def _send_invoice_for_direct_buy(
         chat_id: int, user_id: int, product_id: int, quantity: int,
         shop_id: int, bot: Bot, states: dict
 ):
+    if await database.is_shop_purchases_blocked(shop_id):
+        await bot.send_message(
+            chat_id,
+            "⛔ Магазин временно недоступен для покупок (на проверке модерации).",
+            reply_markup=_create_shop_main_menu()
+        )
+        states[user_id] = ShopBotState.MAIN_MENU
+        return
+
     product = await database.get_product_info(product_id)
     if not product:
         await bot.send_message(chat_id, "❌ Товар не найден")
@@ -187,15 +238,22 @@ async def _send_invoice_for_direct_buy(
 
         if total < 1.0:
             await database.use_promocode(promo['id'])
-            await database.buy_product(shop_id, user_id, product_id, quantity, 0,
-                                       'Цифровой товар (промокод 100%)')
+            order_id = await database.buy_product(
+                shop_id, user_id, product_id, quantity, 0,
+                'Цифровой товар (промокод 100%)',
+                status=database.ORDER_STATUS_PAID,
+                payment_method='promocode'
+            )
             await bot.send_message(
                 chat_id,
-                f"✅ Товар <b>{title}</b> ×{quantity} оформлен бесплатно по промокоду "
+                f"✅ Заказ #{order_id}: <b>{title}</b> ×{quantity} оформлен бесплатно по промокоду "
                 f"<b>{promo['code']}</b>!",
                 parse_mode=ParseMode.HTML,
                 reply_markup=_create_shop_main_menu()
             )
+            order = await database.get_order(order_id) if order_id else None
+            if order and order.get("digital_content"):
+                await _deliver_digital(order, bot)
             states[user_id] = ShopBotState.MAIN_MENU
             return
         await database.use_promocode(promo['id'])
@@ -276,6 +334,14 @@ async def run_shop_bot(
             await message.answer("❌ Адрес не может быть пустым")
             return
 
+        if await database.is_shop_purchases_blocked(shop_id):
+            await message.answer(
+                "⛔ Магазин временно недоступен для покупок (на проверке модерации).",
+                reply_markup=_create_shop_main_menu()
+            )
+            states[customer_id] = ShopBotState.MAIN_MENU
+            return
+
         shop_info = await database.get_shop_info(shop_id)
         if not shop_info:
             await message.answer("❌ Магазин не найден")
@@ -305,8 +371,14 @@ async def run_shop_bot(
             await database.use_promocode(promo['id'])
             states.pop(f"{customer_id}_promo", None)
 
-        order_ids = await database.place_cart_order(
-            shop_id, customer_id, items, total_price, delivery_address
+        # Cash → cразу processing+paid (продавец подтвердит при отгрузке);
+        # online → new (станет paid после ручной отметки админом или вебхука)
+        initial_status = (database.ORDER_STATUS_PROCESSING
+                          if payment_method == 'cash_on_delivery'
+                          else database.ORDER_STATUS_NEW)
+        group_id, order_ids = await database.place_cart_order(
+            shop_id, customer_id, items, total_price, delivery_address,
+            status=initial_status, payment_method=payment_method
         )
 
         # Уведомляем администраторов через manager_bot
@@ -347,20 +419,50 @@ async def run_shop_bot(
             await message.answer(
                 f"🛒 Заказ оформлен!\n\n{order_details}\n"
                 f"💰 Итог: {total_price:.2f}₽\n🏠 Адрес: {delivery_address}\n"
-                f"💳 Оплата при получении"
+                f"💳 Оплата при получении\n\n"
+                f"Раздел «📋 Мои заказы» — для отслеживания статуса."
             )
+            # Для cash + цифрового товара — сразу шлём контент
+            for oid in order_ids:
+                order = await database.get_order(oid)
+                if order and order.get("digital_content"):
+                    await _deliver_digital(order, bot)
 
         await database.clear_cart(shop_id, customer_id)
         states[customer_id] = ShopBotState.MAIN_MENU
+
+    async def _ensure_terms(user_id: int, username, chat_id: int) -> bool:
+        await database.add_user(user_id, username)
+        if await database.has_accepted_terms(user_id, legal.TERMS_VERSION):
+            return True
+        text = (
+            "👋 Для покупок в магазине нужно принять Правила платформы.\n\n"
+            f"{legal.DISCLAIMER_SHORT}"
+        )
+        await bot.send_message(chat_id, text, reply_markup=keyboards.create_terms_acceptance_menu())
+        return False
 
     # ─── /start ───
 
     @dp.message(Command("start"))
     async def shop_start(message: Message):
-        await database.add_user(message.from_user.id, message.from_user.username)
+        if not await _ensure_terms(message.from_user.id, message.from_user.username, message.chat.id):
+            return
         await database.register_shop_user(shop_id, message.from_user.id)
         states[message.from_user.id] = ShopBotState.MAIN_MENU
         await message.answer(welcome_message, reply_markup=_create_shop_main_menu())
+
+    @dp.message(Command("terms"))
+    async def shop_cmd_terms(message: Message):
+        accepted = await database.has_accepted_terms(message.from_user.id, legal.TERMS_VERSION)
+        suffix = "\n\n✅ Вы уже приняли эти правила." if accepted else ""
+        await message.answer(legal.TERMS_OF_USE + suffix,
+                             reply_markup=keyboards.create_terms_acceptance_menu()
+                             if not accepted else None)
+
+    @dp.message(Command("legal"))
+    async def shop_cmd_legal(message: Message):
+        await message.answer(legal.PROHIBITED_GOODS)
 
     # ─── CALLBACK HANDLER ───
 
@@ -681,6 +783,191 @@ async def run_shop_bot(
                 text, markup = _build_filter_menu_sync(user_id, shop_id, states)
                 await call.message.edit_text(text, reply_markup=markup)
 
+            # ── Мои заказы ──
+            elif data == "my_orders":
+                orders = await database.get_user_orders_in_shop(shop_id, user_id)
+                if not orders:
+                    await call.message.edit_text(
+                        "📋 У вас пока нет заказов.",
+                        reply_markup=_create_shop_main_menu()
+                    )
+                else:
+                    await call.message.edit_text(
+                        f"📋 Ваши заказы ({len(orders)}):",
+                        reply_markup=keyboards.create_my_orders_menu(orders, page=0)
+                    )
+
+            elif data.startswith("my_orders_page_"):
+                try:
+                    page = int(data.rsplit("_", 1)[-1])
+                except ValueError:
+                    page = 0
+                orders = await database.get_user_orders_in_shop(shop_id, user_id)
+                try:
+                    await call.message.edit_text(
+                        f"📋 Ваши заказы ({len(orders)}):",
+                        reply_markup=keyboards.create_my_orders_menu(orders, page=page)
+                    )
+                except Exception:
+                    pass
+
+            elif (data.startswith("my_order_") and not (
+                data.startswith("my_order_refund_") or
+                data.startswith("my_order_dispute_") or
+                data.startswith("my_order_confirm_") or
+                data.startswith("my_order_cancel_")
+            )):
+                order_id = int(data.split("_")[-1])
+                order = await database.get_order(order_id)
+                if not order or order["customer_user_id"] != user_id or order["shop_id"] != shop_id:
+                    await call.answer("Заказ не найден")
+                    return
+                label = database.ORDER_STATUS_LABELS.get(order["status"], order["status"])
+                text = (
+                    f"📋 <b>Заказ #{order['id']}</b>\n"
+                    f"Магазин: {order['shop_name']}\n"
+                    f"Товар: <b>{order['product_name']}</b>\n"
+                    f"Кол-во: {order['quantity']}\n"
+                    f"Сумма: {order['total_price']}₽\n"
+                    f"Способ оплаты: {order['payment_method'] or '—'}\n"
+                    f"Адрес: {order['delivery_address']}\n"
+                    f"Статус: {label}\n"
+                    f"Создан: {order['created_at']}\n"
+                )
+                if order.get('paid_at'):
+                    text += f"Оплачен: {order['paid_at']}\n"
+                if order.get('delivered_at'):
+                    text += f"Доставлен: {order['delivered_at']}\n"
+                await call.message.edit_text(
+                    text, reply_markup=keyboards.create_my_order_actions_menu(order),
+                    parse_mode=ParseMode.HTML
+                )
+
+            elif data.startswith("my_order_confirm_"):
+                order_id = int(data.split("_")[-1])
+                order = await database.get_order(order_id)
+                if not order or order["customer_user_id"] != user_id:
+                    await call.answer("Заказ не найден")
+                    return
+                ok = await database.update_order_status(order_id, database.ORDER_STATUS_COMPLETED)
+                if ok:
+                    await call.answer("✅ Спасибо за подтверждение получения!")
+                else:
+                    await call.answer("Не удалось обновить статус")
+                # Уведомим продавца
+                shop_info = await database.get_shop_info(shop_id)
+                if shop_info:
+                    try:
+                        await manager_bot.send_message(
+                            shop_info[1],
+                            f"✅ Покупатель подтвердил получение заказа #{order_id}."
+                        )
+                    except Exception:
+                        pass
+                # Возвращаем в список
+                orders = await database.get_user_orders_in_shop(shop_id, user_id)
+                await call.message.edit_text(
+                    f"📋 Ваши заказы ({len(orders)}):",
+                    reply_markup=keyboards.create_my_orders_menu(orders)
+                )
+
+            elif data.startswith("my_order_cancel_"):
+                order_id = int(data.split("_")[-1])
+                order = await database.get_order(order_id)
+                if not order or order["customer_user_id"] != user_id:
+                    await call.answer("Заказ не найден")
+                    return
+                if order["status"] not in (database.ORDER_STATUS_NEW,):
+                    await call.answer("Отменить можно только новый неоплаченный заказ")
+                    return
+                await database.update_order_status(order_id, database.ORDER_STATUS_CANCELED)
+                await call.answer("✅ Заказ отменён")
+                orders = await database.get_user_orders_in_shop(shop_id, user_id)
+                await call.message.edit_text(
+                    f"📋 Ваши заказы ({len(orders)}):",
+                    reply_markup=keyboards.create_my_orders_menu(orders)
+                )
+
+            elif data.startswith("my_order_refund_"):
+                order_id = int(data.split("_")[-1])
+                order = await database.get_order(order_id)
+                if not order or order["customer_user_id"] != user_id:
+                    await call.answer("Заказ не найден")
+                    return
+                states[user_id] = ShopBotState.REFUND_REASON
+                states[f"{user_id}_refund_order_id"] = order_id
+                await call.message.edit_text(
+                    "💸 Опишите кратко, почему запрашиваете возврат:\n\nОтправьте «назад» для отмены.",
+                    reply_markup=keyboards.create_back_button_menu(f"my_order_{order_id}")
+                )
+
+            elif data.startswith("my_order_dispute_"):
+                order_id = int(data.split("_")[-1])
+                order = await database.get_order(order_id)
+                if not order or order["customer_user_id"] != user_id:
+                    await call.answer("Заказ не найден")
+                    return
+                states[user_id] = ShopBotState.DISPUTE_REASON
+                states[f"{user_id}_dispute_order_id"] = order_id
+                await call.message.edit_text(
+                    "⚖️ Опишите проблему — модерация рассмотрит спор:\n\nОтправьте «назад» для отмены.",
+                    reply_markup=keyboards.create_back_button_menu(f"my_order_{order_id}")
+                )
+
+            # ── Жалоба на магазин ──
+            elif data == "shop_complain_root":
+                if await database.has_complained(shop_id, user_id):
+                    await call.message.edit_text(
+                        "🚩 Вы уже оставляли жалобу на этот магазин. Модерация рассмотрит её.",
+                        reply_markup=_create_shop_main_menu()
+                    )
+                    return
+                states[user_id] = ShopBotState.COMPLAINT_REASON
+                await call.message.edit_text(
+                    "🚩 Опишите кратко причину жалобы (нарушения правил, мошенничество и т.п.):\n\n"
+                    "Отправьте «назад» для отмены.",
+                    reply_markup=keyboards.create_back_button_menu("shop_main_menu")
+                )
+
+            # ── Правила ──
+            elif data == "shop_terms":
+                await call.message.edit_text(
+                    legal.TERMS_OF_USE,
+                    reply_markup=keyboards.create_back_button_menu("shop_main_menu"),
+                    parse_mode=ParseMode.HTML
+                )
+
+            elif data == "terms_show":
+                await call.message.edit_text(
+                    legal.TERMS_OF_USE,
+                    reply_markup=keyboards.create_terms_back_menu("terms_back"),
+                    parse_mode=ParseMode.HTML
+                )
+
+            elif data == "terms_legal":
+                await call.message.edit_text(
+                    legal.PROHIBITED_GOODS,
+                    reply_markup=keyboards.create_terms_back_menu("terms_back"),
+                    parse_mode=ParseMode.HTML
+                )
+
+            elif data == "terms_back":
+                await call.message.edit_text(
+                    "👋 Для покупок в магазине нужно принять Правила платформы.\n\n"
+                    f"{legal.DISCLAIMER_SHORT}",
+                    reply_markup=keyboards.create_terms_acceptance_menu(),
+                    parse_mode=ParseMode.HTML
+                )
+
+            elif data == "terms_accept":
+                await database.accept_terms(user_id, legal.TERMS_VERSION)
+                await database.register_shop_user(shop_id, user_id)
+                states[user_id] = ShopBotState.MAIN_MENU
+                await call.message.edit_text(
+                    "✅ Правила приняты!\n\n" + welcome_message,
+                    reply_markup=_create_shop_main_menu()
+                )
+
             elif data == "apply_filters":
                 f = states.get(f"{user_id}_filters", {})
                 results = await database.search_products(
@@ -898,8 +1185,38 @@ async def run_shop_bot(
             user_id     = int(parts[3])
             quantity    = int(parts[5])
             total_price = message.successful_payment.total_amount / 100
-            if await database.buy_product(shop_id, user_id, product_id, quantity, total_price, 'Цифровой товар (оплачено)'):
-                await message.answer("✅ Товар успешно оплачен и добавлен в ваши покупки!")
+            order_id = await database.buy_product(
+                shop_id, user_id, product_id, quantity, total_price,
+                'Цифровой товар (оплачено)',
+                status=database.ORDER_STATUS_PAID,
+                payment_method='telegram_payments'
+            )
+            if order_id:
+                await message.answer(f"✅ Заказ #{order_id} оплачен!")
+                # Авто-доставка цифрового контента
+                order = await database.get_order(order_id)
+                if order and order.get("digital_content"):
+                    await _deliver_digital(order, bot)
+                else:
+                    await message.answer(
+                        "📋 Раздел «Мои заказы» — для отслеживания статуса.\n"
+                        "Если контент не пришёл автоматически — продавец отправит его вручную."
+                    )
+                # Уведомим продавца
+                shop_info = await database.get_shop_info(shop_id)
+                if shop_info:
+                    admin_ids = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
+                    for aid in set(admin_ids):
+                        try:
+                            await manager_bot.send_message(
+                                aid,
+                                f"💳 Заказ #{order_id} оплачен онлайн.\n"
+                                f"Магазин: {shop_info[2]}\n"
+                                f"Товар: id={product_id} ×{quantity}\n"
+                                f"Сумма: {total_price:.2f}₽"
+                            )
+                        except Exception:
+                            pass
             else:
                 await message.answer("❌ Ошибка при обработке покупки")
         except Exception as e:
@@ -909,6 +1226,143 @@ async def run_shop_bot(
     @dp.pre_checkout_query()
     async def pre_checkout(query: PreCheckoutQuery):
         await query.answer(ok=True)
+
+    # ─── Новые состояния: жалоба, возврат, спор ───
+
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.COMPLAINT_REASON))
+    async def handle_complaint_reason(message: Message):
+        user_id = message.from_user.id
+        text = (message.text or "").strip()
+        if text.lower() == "назад":
+            states[user_id] = ShopBotState.MAIN_MENU
+            await message.answer("❌ Отменено", reply_markup=_create_shop_main_menu())
+            return
+        if len(text) < 5:
+            await message.answer("❌ Слишком короткая жалоба, минимум 5 символов")
+            return
+        cid = await database.add_complaint(shop_id, user_id, text[:1000])
+        if not cid:
+            await message.answer("❌ Не удалось зарегистрировать жалобу", reply_markup=_create_shop_main_menu())
+            states[user_id] = ShopBotState.MAIN_MENU
+            return
+        # Проверяем порог
+        count = await database.count_open_complaints(shop_id)
+        threshold = config.COMPLAINT_THRESHOLD
+        moved_to_review = False
+        if count >= threshold:
+            cur_status = await database.get_shop_status(shop_id)
+            if cur_status != database.SHOP_STATUS_UNDER_REVIEW:
+                await database.set_shop_status(
+                    shop_id, database.SHOP_STATUS_UNDER_REVIEW,
+                    f"Накоплено жалоб: {count}"
+                )
+                moved_to_review = True
+        await message.answer(
+            f"✅ Жалоба #{cid} зарегистрирована. Спасибо!\n"
+            f"{'⚠️ Магазин помечен на проверку модерации.' if moved_to_review else ''}",
+            reply_markup=_create_shop_main_menu()
+        )
+        states[user_id] = ShopBotState.MAIN_MENU
+        # Уведомляем модераторов
+        notify_text = (
+            f"🚩 Новая жалоба #{cid} на магазин (id={shop_id})\n"
+            f"Открытых жалоб: {count}\n"
+            f"От: @{message.from_user.username or user_id}\n"
+            f"Причина: {text[:500]}"
+        )
+        for mid in set((config.OWNER_IDS or []) + (config.MODERATOR_IDS or [])):
+            try:
+                await manager_bot.send_message(mid, notify_text)
+            except Exception:
+                pass
+
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.REFUND_REASON))
+    async def handle_refund_reason(message: Message):
+        user_id  = message.from_user.id
+        order_id = states.get(f"{user_id}_refund_order_id")
+        text = (message.text or "").strip()
+        if text.lower() == "назад":
+            states[user_id] = ShopBotState.MAIN_MENU
+            states.pop(f"{user_id}_refund_order_id", None)
+            await message.answer("❌ Отменено", reply_markup=_create_shop_main_menu())
+            return
+        if not order_id or len(text) < 3:
+            await message.answer("❌ Слишком короткое описание")
+            return
+        order = await database.get_order(order_id)
+        if not order or order["customer_user_id"] != user_id:
+            await message.answer("❌ Заказ не найден", reply_markup=_create_shop_main_menu())
+            states[user_id] = ShopBotState.MAIN_MENU
+            return
+        await database.update_order_status(order_id, database.ORDER_STATUS_REFUND_REQUESTED, text[:500])
+        await message.answer(
+            f"✅ Запрос на возврат по заказу #{order_id} зарегистрирован.\n"
+            f"Продавец рассмотрит его в течение 3 рабочих дней.",
+            reply_markup=_create_shop_main_menu()
+        )
+        states[user_id] = ShopBotState.MAIN_MENU
+        states.pop(f"{user_id}_refund_order_id", None)
+        # Уведомим продавца
+        shop_info = await database.get_shop_info(shop_id)
+        if shop_info:
+            try:
+                await manager_bot.send_message(
+                    shop_info[1],
+                    f"💸 Запрос возврата по заказу #{order_id}\nПричина: {text[:500]}"
+                )
+            except Exception:
+                pass
+
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.DISPUTE_REASON))
+    async def handle_dispute_reason(message: Message):
+        user_id  = message.from_user.id
+        order_id = states.get(f"{user_id}_dispute_order_id")
+        text = (message.text or "").strip()
+        if text.lower() == "назад":
+            states[user_id] = ShopBotState.MAIN_MENU
+            states.pop(f"{user_id}_dispute_order_id", None)
+            await message.answer("❌ Отменено", reply_markup=_create_shop_main_menu())
+            return
+        if not order_id or len(text) < 5:
+            await message.answer("❌ Слишком короткое описание (минимум 5 символов)")
+            return
+        order = await database.get_order(order_id)
+        if not order or order["customer_user_id"] != user_id:
+            await message.answer("❌ Заказ не найден", reply_markup=_create_shop_main_menu())
+            states[user_id] = ShopBotState.MAIN_MENU
+            return
+        did = await database.open_dispute(order_id, user_id, "customer", text[:1000])
+        if not did:
+            await message.answer("❌ Не удалось открыть спор", reply_markup=_create_shop_main_menu())
+            states[user_id] = ShopBotState.MAIN_MENU
+            return
+        await database.add_dispute_message(did, user_id, "customer", text[:1000])
+        await message.answer(
+            f"✅ Спор #{did} по заказу #{order_id} открыт. Модерация рассмотрит его.",
+            reply_markup=_create_shop_main_menu()
+        )
+        states[user_id] = ShopBotState.MAIN_MENU
+        states.pop(f"{user_id}_dispute_order_id", None)
+        # Уведомим продавца и модерацию
+        shop_info = await database.get_shop_info(shop_id)
+        if shop_info:
+            try:
+                await manager_bot.send_message(
+                    shop_info[1],
+                    f"⚖️ Покупатель открыл спор #{did} по заказу #{order_id}.\n"
+                    f"Причина: {text[:500]}"
+                )
+            except Exception:
+                pass
+        for mid in set((config.OWNER_IDS or []) + (config.MODERATOR_IDS or [])):
+            try:
+                await manager_bot.send_message(
+                    mid,
+                    f"⚖️ Новый спор #{did} (заказ #{order_id}, магазин id={shop_id}).\n"
+                    f"Откройте /moderation для рассмотрения."
+                )
+            except Exception:
+                pass
 
     # ─── Запуск ───
     try:

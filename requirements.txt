@@ -1,6 +1,8 @@
+aiogram
 aiohappyeyeballs
 aiohttp
 aiosignal
+aiosqlite
 attrs
 certifi
 charset-normalizer
@@ -19,6 +21,7 @@ propcache
 Pygments
 pyTelegramBotAPI
 pytest
+python-dotenv
 requests
 SQLAlchemy
 typing_extensions

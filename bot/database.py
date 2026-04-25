@@ -18,7 +18,44 @@ from typing import Optional
 import aiosqlite
 from yookassa import Configuration, Payment
 
-DB_NAME = "db/shop_manager.db"
+import config
+
+DB_NAME = config.DB_PATH
+
+# ── Статусы заказа ──
+ORDER_STATUS_NEW              = "new"
+ORDER_STATUS_PAID             = "paid"
+ORDER_STATUS_PROCESSING       = "processing"
+ORDER_STATUS_SHIPPED          = "shipped"
+ORDER_STATUS_DELIVERED        = "delivered"
+ORDER_STATUS_COMPLETED        = "completed"
+ORDER_STATUS_CANCELED         = "canceled"
+ORDER_STATUS_REFUND_REQUESTED = "refund_requested"
+ORDER_STATUS_REFUNDED         = "refunded"
+ORDER_STATUS_DISPUTED         = "disputed"
+
+ORDER_STATUS_LABELS = {
+    ORDER_STATUS_NEW:              "🆕 Новый",
+    ORDER_STATUS_PAID:             "💰 Оплачен",
+    ORDER_STATUS_PROCESSING:       "⚙️ В обработке",
+    ORDER_STATUS_SHIPPED:          "📦 Отправлен",
+    ORDER_STATUS_DELIVERED:        "🚚 Доставлен",
+    ORDER_STATUS_COMPLETED:        "✅ Завершён",
+    ORDER_STATUS_CANCELED:         "❌ Отменён",
+    ORDER_STATUS_REFUND_REQUESTED: "↩️ Запрошен возврат",
+    ORDER_STATUS_REFUNDED:         "💸 Возвращён",
+    ORDER_STATUS_DISPUTED:         "⚖️ Спор",
+}
+
+# ── Статусы магазина ──
+SHOP_STATUS_ACTIVE       = "active"
+SHOP_STATUS_UNDER_REVIEW = "under_review"
+SHOP_STATUS_BANNED       = "banned"
+
+# ── Статусы спора ──
+DISPUTE_STATUS_OPEN     = "open"
+DISPUTE_STATUS_RESOLVED = "resolved"
+DISPUTE_STATUS_CANCELED = "canceled"
 
 # ─────────────────── ИНИЦИАЛИЗАЦИЯ (sync, вызывается один раз) ───────────────────
 
@@ -136,6 +173,50 @@ def init_database():
         UNIQUE (shop_id, code),
         FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS terms_acceptance (
+        user_id INTEGER PRIMARY KEY,
+        version INTEGER NOT NULL,
+        accepted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS complaints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shop_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        status TEXT DEFAULT 'open',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (shop_id, user_id),
+        FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS disputes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        shop_id INTEGER NOT NULL,
+        opened_by INTEGER NOT NULL,
+        opener_role TEXT NOT NULL,        -- 'customer' | 'seller'
+        reason TEXT NOT NULL,
+        status TEXT DEFAULT 'open',       -- 'open' | 'resolved' | 'canceled'
+        resolution TEXT,                  -- 'refund' | 'complete' | 'reject' | NULL
+        resolution_note TEXT,
+        resolved_by INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        closed_at TIMESTAMP,
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+        FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS dispute_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dispute_id INTEGER NOT NULL,
+        author_id INTEGER NOT NULL,
+        author_role TEXT NOT NULL,        -- 'customer' | 'seller' | 'moderator'
+        body TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (dispute_id) REFERENCES disputes(id) ON DELETE CASCADE
+    );
     """)
     conn.commit()
 
@@ -151,8 +232,21 @@ def init_database():
     _add_column("shops", "yookassa_credentials", "TEXT")
     _add_column("shops", "paymaster_token", "TEXT")
     _add_column("shops", "bot_username", "TEXT")
+    _add_column("shops", "status", "TEXT DEFAULT 'active'")
+    _add_column("shops", "status_reason", "TEXT")
     _add_column("products", "description", "TEXT")
     _add_column("products", "sale_price", "REAL DEFAULT NULL")
+    _add_column("products", "digital_content", "TEXT")
+    _add_column("products", "digital_content_kind", "TEXT")  # 'text' | 'url' | 'file_id' | 'photo_id'
+    _add_column("products", "digital_ttl_hours", "INTEGER")
+    _add_column("orders", "updated_at", "TIMESTAMP")
+    _add_column("orders", "paid_at", "TIMESTAMP")
+    _add_column("orders", "delivered_at", "TIMESTAMP")
+    _add_column("orders", "closed_at", "TIMESTAMP")
+    _add_column("orders", "payment_method", "TEXT")
+    _add_column("orders", "delivery_payload", "TEXT")  # сохранённый цифровой контент, отправленный покупателю
+    _add_column("orders", "seller_note", "TEXT")
+    _add_column("orders", "order_group_id", "TEXT")
 
     conn.close()
 
@@ -710,36 +804,73 @@ async def get_shop_orders(shop_id: int):
 
 
 async def buy_product(shop_id: int, user_id: int, product_id: int,
-                      quantity: int, total_price: float, delivery_address: str = 'Цифровой товар') -> bool:
+                      quantity: int, total_price: float,
+                      delivery_address: str = 'Цифровой товар',
+                      status: str = ORDER_STATUS_NEW,
+                      payment_method: Optional[str] = None,
+                      group_id: Optional[str] = None) -> Optional[int]:
+    """Создаёт одну строку заказа. Возвращает id или None."""
     if not all(isinstance(x, int) and x > 0 for x in (shop_id, user_id, product_id, quantity)):
-        return False
+        return None
     if not isinstance(total_price, (int, float)) or total_price < 0:
-        return False
+        return None
+    paid_at_sql = "CURRENT_TIMESTAMP" if status == ORDER_STATUS_PAID else "NULL"
     async with _db() as db:
         try:
-            await db.execute(
-                "INSERT INTO orders (shop_id, customer_user_id, product_id, quantity, total_price, delivery_address) VALUES (?,?,?,?,?,?)",
-                (shop_id, user_id, product_id, quantity, total_price, delivery_address)
-            )
-            await db.commit()
-            return True
+            async with db.execute(
+                f"INSERT INTO orders (shop_id, customer_user_id, product_id, quantity, total_price, "
+                f"delivery_address, status, payment_method, order_group_id, updated_at, paid_at) "
+                f"VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,{paid_at_sql})",
+                (shop_id, user_id, product_id, quantity, total_price, delivery_address,
+                 status, payment_method, group_id)
+            ) as cur:
+                return cur.lastrowid
         except Exception as e:
             logging.error(f"Ошибка добавления заказа: {e}")
-            return False
+            return None
+        finally:
+            await db.commit()
 
 
-async def place_cart_order(shop_id: int, customer_id: int, items, total_price: float, delivery_address: str):
-    """Записывает все товары из корзины как отдельные заказы. Возвращает список order_id."""
+async def place_cart_order(shop_id: int, customer_id: int, items, total_price: float,
+                           delivery_address: str,
+                           status: str = ORDER_STATUS_NEW,
+                           payment_method: Optional[str] = None,
+                           group_id: Optional[str] = None):
+    """Записывает товары из корзины как отдельные заказы (одной группой).
+
+    Каждая строка получает свою стоимость `price * quantity`. Параметр
+    `total_price` (общий итог по корзине с учётом промокода) сохраняется
+    как поле первой строки группы для удобства отображения.
+
+    Возвращает (group_id, [order_id, ...]).
+    """
+    if not group_id:
+        group_id = uuid.uuid4().hex
+    paid_at_sql = "CURRENT_TIMESTAMP" if status == ORDER_STATUS_PAID else "NULL"
     order_ids = []
     async with _db() as db:
-        for pid, name, price, quantity in items:
+        for idx, (pid, _name, price, quantity) in enumerate(items):
+            line_total = float(price) * int(quantity)
+            # Скидку (если есть) кладём пропорционально на первую строку,
+            # чтобы суммарно по группе получился total_price.
+            if idx == 0 and total_price is not None:
+                # Перераспределяем разницу между line_total всех позиций и total_price
+                gross = sum(float(p) * int(q) for _pid, _n, p, q in items)
+                if gross > 0:
+                    line_total = round(line_total + (total_price - gross), 2)
+                    if line_total < 0:
+                        line_total = 0
             async with db.execute(
-                "INSERT INTO orders (shop_id, customer_user_id, product_id, quantity, total_price, delivery_address) VALUES (?,?,?,?,?,?)",
-                (shop_id, customer_id, pid, quantity, total_price, delivery_address)
+                f"INSERT INTO orders (shop_id, customer_user_id, product_id, quantity, total_price, "
+                f"delivery_address, status, payment_method, order_group_id, updated_at, paid_at) "
+                f"VALUES (?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,{paid_at_sql})",
+                (shop_id, customer_id, pid, quantity, line_total, delivery_address,
+                 status, payment_method, group_id)
             ) as cur:
                 order_ids.append(cur.lastrowid)
         await db.commit()
-    return order_ids
+    return group_id, order_ids
 
 
 async def get_shop_admins_ids(shop_id: int):
@@ -1001,3 +1132,434 @@ async def get_shop_products_for_promo_check(shop_id: int):
             WHERE c.shop_id=?
         """, (shop_id,)) as cur:
             return await cur.fetchall()
+
+# ─────────────────── ПРИНЯТИЕ ПРАВИЛ (TERMS) ───────────────────
+
+async def has_accepted_terms(user_id: int, version: int) -> bool:
+    if not isinstance(user_id, int) or user_id <= 0:
+        return False
+    async with _db() as db:
+        async with db.execute(
+            "SELECT version FROM terms_acceptance WHERE user_id=?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return bool(row and row[0] >= version)
+
+
+async def accept_terms(user_id: int, version: int) -> None:
+    if not isinstance(user_id, int) or user_id <= 0:
+        return
+    async with _db() as db:
+        await db.execute(
+            "INSERT INTO terms_acceptance (user_id, version) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET version=excluded.version, "
+            "accepted_at=CURRENT_TIMESTAMP",
+            (user_id, version)
+        )
+        await db.commit()
+
+
+# ─────────────────── СТАТУС МАГАЗИНА ───────────────────
+
+async def get_shop_status(shop_id: int) -> Optional[str]:
+    async with _db() as db:
+        async with db.execute("SELECT status FROM shops WHERE id=?", (shop_id,)) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def set_shop_status(shop_id: int, status: str, reason: Optional[str] = None) -> None:
+    async with _db() as db:
+        await db.execute(
+            "UPDATE shops SET status=?, status_reason=? WHERE id=?",
+            (status, reason, shop_id)
+        )
+        await db.commit()
+
+
+async def is_shop_purchases_blocked(shop_id: int) -> bool:
+    """Возвращает True, если в магазине нельзя совершать новые покупки."""
+    status = await get_shop_status(shop_id)
+    return status in (SHOP_STATUS_UNDER_REVIEW, SHOP_STATUS_BANNED)
+
+
+# ─────────────────── ЖАЛОБЫ ───────────────────
+
+async def add_complaint(shop_id: int, user_id: int, reason: str) -> Optional[int]:
+    """Создаёт жалобу. Возвращает id или None если уже есть от этого пользователя."""
+    if not isinstance(shop_id, int) or shop_id <= 0:
+        return None
+    if not isinstance(user_id, int) or user_id <= 0:
+        return None
+    reason = (reason or "").strip()
+    if len(reason) < 3:
+        return None
+    async with _db() as db:
+        try:
+            async with db.execute(
+                "INSERT INTO complaints (shop_id, user_id, reason) VALUES (?,?,?)",
+                (shop_id, user_id, reason)
+            ) as cur:
+                cid = cur.lastrowid
+            await db.commit()
+            return cid
+        except aiosqlite.IntegrityError:
+            return None
+
+
+async def count_open_complaints(shop_id: int) -> int:
+    async with _db() as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM complaints WHERE shop_id=? AND status='open'",
+            (shop_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else 0
+
+
+async def get_open_complaints(shop_id: int):
+    async with _db() as db:
+        async with db.execute(
+            "SELECT c.id, c.user_id, c.reason, c.created_at, u.username "
+            "FROM complaints c LEFT JOIN users u ON c.user_id = u.tg_id "
+            "WHERE c.shop_id=? AND c.status='open' ORDER BY c.created_at DESC",
+            (shop_id,)
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def get_shops_under_review():
+    async with _db() as db:
+        async with db.execute(
+            "SELECT id, shop_name, user_id, status_reason FROM shops "
+            "WHERE status=? ORDER BY id DESC", (SHOP_STATUS_UNDER_REVIEW,)
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def resolve_complaints(shop_id: int, resolution: str) -> int:
+    """resolution: 'dismissed' | 'confirmed'. Возвращает количество затронутых строк."""
+    async with _db() as db:
+        async with db.execute(
+            "UPDATE complaints SET status=? WHERE shop_id=? AND status='open'",
+            (resolution, shop_id)
+        ) as cur:
+            n = cur.rowcount
+        await db.commit()
+    return n
+
+
+async def has_complained(shop_id: int, user_id: int) -> bool:
+    async with _db() as db:
+        async with db.execute(
+            "SELECT 1 FROM complaints WHERE shop_id=? AND user_id=?",
+            (shop_id, user_id)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+
+# ─────────────────── ЦИФРОВАЯ ДОСТАВКА ───────────────────
+
+async def update_product_digital(product_id: int, kind: Optional[str],
+                                 content: Optional[str],
+                                 ttl_hours: Optional[int]) -> bool:
+    """kind: 'text' | 'url' | 'file_id' | 'photo_id' | None (очистить)."""
+    if not isinstance(product_id, int) or product_id <= 0:
+        return False
+    if kind is not None and kind not in ("text", "url", "file_id", "photo_id"):
+        return False
+    async with _db() as db:
+        await db.execute(
+            "UPDATE products SET digital_content=?, digital_content_kind=?, digital_ttl_hours=? WHERE id=?",
+            (content, kind, ttl_hours, product_id)
+        )
+        await db.commit()
+    return True
+
+
+async def get_product_digital(product_id: int):
+    """Возвращает (kind, content, ttl_hours) или None."""
+    async with _db() as db:
+        async with db.execute(
+            "SELECT digital_content_kind, digital_content, digital_ttl_hours, is_digital "
+            "FROM products WHERE id=?", (product_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    kind, content, ttl, is_digital = row
+    return {"kind": kind, "content": content, "ttl_hours": ttl, "is_digital": bool(is_digital)}
+
+
+# ─────────────────── ЗАКАЗЫ: ЖИЗНЕННЫЙ ЦИКЛ ───────────────────
+
+async def get_order(order_id: int):
+    """Полная строка заказа со всеми колонками + название товара."""
+    async with _db() as db:
+        async with db.execute(
+            "SELECT o.id, o.shop_id, o.customer_user_id, o.product_id, o.quantity, "
+            "o.total_price, o.delivery_address, o.status, o.created_at, "
+            "o.updated_at, o.paid_at, o.delivered_at, o.closed_at, o.payment_method, "
+            "o.delivery_payload, o.seller_note, o.order_group_id, "
+            "p.name, p.is_digital, p.digital_content, p.digital_content_kind, p.digital_ttl_hours, "
+            "u.username, s.shop_name "
+            "FROM orders o "
+            "JOIN products p ON o.product_id=p.id "
+            "LEFT JOIN users u ON o.customer_user_id=u.tg_id "
+            "JOIN shops s ON o.shop_id=s.id "
+            "WHERE o.id=?",
+            (order_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    keys = ["id", "shop_id", "customer_user_id", "product_id", "quantity",
+            "total_price", "delivery_address", "status", "created_at",
+            "updated_at", "paid_at", "delivered_at", "closed_at", "payment_method",
+            "delivery_payload", "seller_note", "order_group_id",
+            "product_name", "is_digital", "digital_content", "digital_content_kind",
+            "digital_ttl_hours", "username", "shop_name"]
+    return dict(zip(keys, row))
+
+
+async def get_orders_by_group(group_id: str):
+    if not group_id:
+        return []
+    async with _db() as db:
+        async with db.execute(
+            "SELECT o.id FROM orders o WHERE o.order_group_id=? ORDER BY o.id",
+            (group_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    out = []
+    for (oid,) in rows:
+        info = await get_order(oid)
+        if info:
+            out.append(info)
+    return out
+
+
+async def get_user_orders(user_id: int, limit: int = 50):
+    async with _db() as db:
+        async with db.execute(
+            "SELECT o.id, o.order_group_id, o.shop_id, s.shop_name, p.name, "
+            "o.quantity, o.total_price, o.status, o.created_at "
+            "FROM orders o "
+            "JOIN products p ON o.product_id=p.id "
+            "JOIN shops s ON o.shop_id=s.id "
+            "WHERE o.customer_user_id=? "
+            "ORDER BY o.created_at DESC LIMIT ?",
+            (user_id, limit)
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def get_user_orders_in_shop(shop_id: int, user_id: int, limit: int = 50):
+    async with _db() as db:
+        async with db.execute(
+            "SELECT o.id, o.order_group_id, o.shop_id, s.shop_name, p.name, "
+            "o.quantity, o.total_price, o.status, o.created_at "
+            "FROM orders o "
+            "JOIN products p ON o.product_id=p.id "
+            "JOIN shops s ON o.shop_id=s.id "
+            "WHERE o.customer_user_id=? AND o.shop_id=? "
+            "ORDER BY o.created_at DESC LIMIT ?",
+            (user_id, shop_id, limit)
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def update_order_status(order_id: int, new_status: str,
+                              note: Optional[str] = None) -> bool:
+    if new_status not in ORDER_STATUS_LABELS:
+        return False
+    fields = ["status=?", "updated_at=CURRENT_TIMESTAMP"]
+    params = [new_status]
+    if new_status == ORDER_STATUS_PAID:
+        fields.append("paid_at=CURRENT_TIMESTAMP")
+    if new_status == ORDER_STATUS_DELIVERED:
+        fields.append("delivered_at=CURRENT_TIMESTAMP")
+    if new_status in (ORDER_STATUS_COMPLETED, ORDER_STATUS_REFUNDED, ORDER_STATUS_CANCELED):
+        fields.append("closed_at=CURRENT_TIMESTAMP")
+    if note is not None:
+        fields.append("seller_note=?")
+        params.append(note)
+    params.append(order_id)
+    async with _db() as db:
+        await db.execute(
+            f"UPDATE orders SET {', '.join(fields)} WHERE id=?", params
+        )
+        await db.commit()
+    return True
+
+
+async def set_order_delivery_payload(order_id: int, payload: str) -> None:
+    async with _db() as db:
+        await db.execute(
+            "UPDATE orders SET delivery_payload=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (payload, order_id)
+        )
+        await db.commit()
+
+
+async def get_paid_unpaid_count_in_shop(shop_id: int):
+    async with _db() as db:
+        async with db.execute(
+            "SELECT status, COUNT(*) FROM orders WHERE shop_id=? GROUP BY status",
+            (shop_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    return dict(rows)
+
+
+# ─────────────────── СПОРЫ ───────────────────
+
+async def open_dispute(order_id: int, opened_by: int, opener_role: str,
+                       reason: str) -> Optional[int]:
+    if opener_role not in ("customer", "seller"):
+        return None
+    reason = (reason or "").strip()
+    if len(reason) < 3:
+        return None
+    order = await get_order(order_id)
+    if not order:
+        return None
+    async with _db() as db:
+        # уже есть открытый спор?
+        async with db.execute(
+            "SELECT id FROM disputes WHERE order_id=? AND status='open'",
+            (order_id,)
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing:
+            return existing[0]
+        async with db.execute(
+            "INSERT INTO disputes (order_id, shop_id, opened_by, opener_role, reason) "
+            "VALUES (?,?,?,?,?)",
+            (order_id, order["shop_id"], opened_by, opener_role, reason)
+        ) as cur:
+            did = cur.lastrowid
+        await db.execute(
+            "UPDATE orders SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (ORDER_STATUS_DISPUTED, order_id)
+        )
+        await db.commit()
+    return did
+
+
+async def get_dispute(dispute_id: int):
+    async with _db() as db:
+        async with db.execute(
+            "SELECT d.id, d.order_id, d.shop_id, d.opened_by, d.opener_role, "
+            "d.reason, d.status, d.resolution, d.resolution_note, d.resolved_by, "
+            "d.created_at, d.closed_at, s.shop_name "
+            "FROM disputes d JOIN shops s ON d.shop_id=s.id WHERE d.id=?",
+            (dispute_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    keys = ["id", "order_id", "shop_id", "opened_by", "opener_role", "reason",
+            "status", "resolution", "resolution_note", "resolved_by",
+            "created_at", "closed_at", "shop_name"]
+    return dict(zip(keys, row))
+
+
+async def add_dispute_message(dispute_id: int, author_id: int,
+                              author_role: str, body: str) -> Optional[int]:
+    body = (body or "").strip()
+    if not body:
+        return None
+    if author_role not in ("customer", "seller", "moderator"):
+        return None
+    async with _db() as db:
+        async with db.execute(
+            "INSERT INTO dispute_messages (dispute_id, author_id, author_role, body) "
+            "VALUES (?,?,?,?)",
+            (dispute_id, author_id, author_role, body)
+        ) as cur:
+            mid = cur.lastrowid
+        await db.commit()
+    return mid
+
+
+async def get_dispute_messages(dispute_id: int):
+    async with _db() as db:
+        async with db.execute(
+            "SELECT author_id, author_role, body, created_at "
+            "FROM dispute_messages WHERE dispute_id=? ORDER BY id",
+            (dispute_id,)
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def resolve_dispute(dispute_id: int, resolved_by: int,
+                          resolution: str,
+                          resolution_note: Optional[str] = None) -> bool:
+    """resolution: 'refund' | 'complete' | 'reject'"""
+    if resolution not in ("refund", "complete", "reject"):
+        return False
+    dispute = await get_dispute(dispute_id)
+    if not dispute or dispute["status"] != DISPUTE_STATUS_OPEN:
+        return False
+    async with _db() as db:
+        await db.execute(
+            "UPDATE disputes SET status=?, resolution=?, resolution_note=?, "
+            "resolved_by=?, closed_at=CURRENT_TIMESTAMP WHERE id=?",
+            (DISPUTE_STATUS_RESOLVED, resolution, resolution_note, resolved_by, dispute_id)
+        )
+        # Обновляем статус заказа в зависимости от решения
+        if resolution == "refund":
+            new_status = ORDER_STATUS_REFUNDED
+        elif resolution == "complete":
+            new_status = ORDER_STATUS_COMPLETED
+        else:  # reject
+            # Возвращаем заказ к paid если был оплачен, иначе new
+            new_status = ORDER_STATUS_PAID
+        await db.execute(
+            "UPDATE orders SET status=?, updated_at=CURRENT_TIMESTAMP, "
+            "closed_at=CASE WHEN ? IN ('completed','refunded') THEN CURRENT_TIMESTAMP "
+            "ELSE closed_at END WHERE id=?",
+            (new_status, new_status, dispute["order_id"])
+        )
+        await db.commit()
+    return True
+
+
+async def get_open_disputes(limit: int = 50):
+    async with _db() as db:
+        async with db.execute(
+            "SELECT d.id, d.order_id, d.shop_id, s.shop_name, d.opener_role, "
+            "d.reason, d.created_at "
+            "FROM disputes d JOIN shops s ON d.shop_id=s.id "
+            "WHERE d.status='open' ORDER BY d.created_at LIMIT ?",
+            (limit,)
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def get_open_disputes_for_shop(shop_id: int):
+    async with _db() as db:
+        async with db.execute(
+            "SELECT d.id, d.order_id, d.opener_role, d.reason, d.created_at "
+            "FROM disputes d "
+            "WHERE d.shop_id=? AND d.status='open' ORDER BY d.created_at",
+            (shop_id,)
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def is_user_in_dispute(order_id: int, user_id: int) -> Optional[int]:
+    """Если пользователь — сторона открытого спора по этому заказу, вернуть dispute_id."""
+    order = await get_order(order_id)
+    if not order:
+        return None
+    async with _db() as db:
+        async with db.execute(
+            "SELECT d.id, d.opened_by FROM disputes d "
+            "WHERE d.order_id=? AND d.status='open'", (order_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return row[0]

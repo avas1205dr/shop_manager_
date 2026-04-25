@@ -25,10 +25,11 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import config
 import database
 import keyboards
+import legal
 import shop_bot as shop_bot_module
 from states import UserState
 
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=getattr(logging, config.LOG_LEVEL, logging.ERROR))
 logger = logging.getLogger(__name__)
 
 # ─── Глобальное состояние ───
@@ -36,8 +37,22 @@ user_states: dict   = {}          # user_id → UserState str  |  "uid_key" → 
 active_shop_bots: dict = {}       # shop_id → Bot instance
 shop_tasks: dict    = {}          # shop_id → asyncio.Task
 
+config.assert_bot_token()
 bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp  = Dispatcher()
+
+
+async def _ensure_terms(user_id: int, username: Optional[str], chat_id: int) -> bool:
+    """Если пользователь не принял актуальные правила — показывает экран принятия и возвращает False."""
+    await database.add_user(user_id, username)
+    if await database.has_accepted_terms(user_id, legal.TERMS_VERSION):
+        return True
+    text = (
+        "👋 Для продолжения нужно принять Правила пользования платформой.\n\n"
+        f"{legal.DISCLAIMER_SHORT}"
+    )
+    await bot.send_message(chat_id, text, reply_markup=keyboards.create_terms_acceptance_menu())
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -83,27 +98,57 @@ async def _stop_shop_bot(shop_id: int):
 #  Команды
 # ──────────────────────────────────────────────────────────────────────────────
 
+WELCOME_TEXT = (
+    "🛍️ Добро пожаловать в Shop Manager Bot!\n\n"
+    "Этот бот поможет вам создать и управлять собственными магазинными ботами в Telegram.\n\n"
+    "Для того чтобы настроить ваш магазин нужно:\n"
+    "• Создать магазин в нашем боте\n"
+    "• Создать бота через @BotFather, скопировать API-токен и вставить в разделе API бота\n"
+    "• Также в @BotFather настроить Payments (инструкция есть в разделе Paymaster) и отправить токен\n"
+    "• Добавить работников, товары, категории и т.д.\n"
+    "• Готово!\n\n\n"
+    "Возможности:\n"
+    "• Создание неограниченного количества магазинов\n"
+    "• Управление товарами и категориями\n"
+    "• Настройка способов оплаты\n"
+    "• Просмотр отзывов и рейтингов\n\n"
+    "Команды: /terms /legal /moderation\n\n"
+    "Выберите действие:"
+)
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await database.add_user(message.from_user.id, message.from_user.username)
-    user_states[message.from_user.id] = UserState.MAIN_MENU
-    welcome_text = (
-        "🛍️ Добро пожаловать в Shop Manager Bot!\n\n"
-        "Этот бот поможет вам создать и управлять собственными магазинными ботами в Telegram.\n\n"
-        "Для того чтобы настроить ваш магазин нужно:\n"
-        "• Создать магазин в нашем боте\n"
-        "• Создать бота через @BotFather, скопировать API-токен и вставить в разделе API бота\n"
-        "• Также в @BotFather настроить Payments (инструкция есть в разделе Paymaster) и отправить токен\n"
-        "• Добавить работников, товары, категории и т.д.\n"
-        "• Готово!\n\n\n"
-        "Возможности:\n"
-        "• Создание неограниченного количества магазинов\n"
-        "• Управление товарами и категориями\n"
-        "• Настройка способов оплаты\n"
-        "• Просмотр отзывов и рейтингов\n\n"
-        "Выберите действие:"
+    user_id = message.from_user.id
+    if not await _ensure_terms(user_id, message.from_user.username, message.chat.id):
+        return
+    user_states[user_id] = UserState.MAIN_MENU
+    await message.answer(WELCOME_TEXT, reply_markup=keyboards.create_main_menu())
+
+
+@dp.message(Command("terms"))
+async def cmd_terms(message: Message):
+    accepted = await database.has_accepted_terms(message.from_user.id, legal.TERMS_VERSION)
+    suffix = "\n\n✅ Вы уже приняли эти правила." if accepted else ""
+    await message.answer(legal.TERMS_OF_USE + suffix,
+                         reply_markup=keyboards.create_terms_acceptance_menu()
+                         if not accepted else None)
+
+
+@dp.message(Command("legal"))
+async def cmd_legal(message: Message):
+    await message.answer(legal.PROHIBITED_GOODS)
+
+
+@dp.message(Command("moderation"))
+async def cmd_moderation(message: Message):
+    if not config.is_moderator(message.from_user.id):
+        await message.answer("⛔ У вас нет прав модератора.")
+        return
+    await message.answer(
+        "🛡️ <b>Панель модерации</b>\n\nВыберите раздел:",
+        reply_markup=keyboards.create_moderation_main_menu()
     )
-    await message.answer(welcome_text, reply_markup=keyboards.create_main_menu())
 
 
 @dp.message(Command("get_id"))
@@ -587,7 +632,326 @@ async def callback_handler(call: CallbackQuery):
             )
 
         elif data.startswith("order_detail_"):
-            await call.answer("Функция в разработке")
+            order_id = int(data.split("_")[-1])
+            order = await database.get_order(order_id)
+            if not order:
+                await call.answer("Заказ не найден")
+                return
+            text = _format_order_for_admin(order)
+            await call.message.edit_text(
+                text, reply_markup=keyboards.create_order_admin_menu(order),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data.startswith("adm_order_set_"):
+            parts = data.split("_")
+            order_id   = int(parts[3])
+            new_status = parts[4]
+            order = await database.get_order(order_id)
+            if not order:
+                await call.answer("Заказ не найден")
+                return
+            ok = await database.update_order_status(order_id, new_status)
+            if not ok:
+                await call.answer("Неверный статус")
+                return
+            await call.answer("✅ Статус обновлён")
+            await _notify_customer_status_change(order_id, new_status)
+            order = await database.get_order(order_id)
+            await call.message.edit_text(
+                _format_order_for_admin(order),
+                reply_markup=keyboards.create_order_admin_menu(order),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data.startswith("adm_order_deliver_"):
+            order_id = int(data.split("_")[-1])
+            order = await database.get_order(order_id)
+            if not order:
+                await call.answer("Заказ не найден")
+                return
+            sent = await _deliver_digital_content(order)
+            if sent:
+                await call.answer("✅ Отправлено покупателю")
+            else:
+                await call.answer("⚠️ Цифровой контент не настроен у товара. Настройте в карточке товара.")
+            order = await database.get_order(order_id)
+            await call.message.edit_text(
+                _format_order_for_admin(order),
+                reply_markup=keyboards.create_order_admin_menu(order),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data.startswith("adm_order_msg_"):
+            order_id = int(data.split("_")[-1])
+            user_states[user_id] = UserState.REPLYING_DISPUTE
+            user_states[_uid(user_id, "reply_order_id")] = order_id
+            user_states[_uid(user_id, "reply_kind")] = "order"
+            await call.message.edit_text(
+                "Введите сообщение для покупателя по заказу:\n\nОтправьте «назад» для отмены.",
+                reply_markup=keyboards.create_back_button_menu(f"order_detail_{order_id}")
+            )
+
+        elif data.startswith("adm_dispute_open_"):
+            order_id = int(data.split("_")[-1])
+            user_states[user_id] = UserState.REPLYING_DISPUTE
+            user_states[_uid(user_id, "reply_order_id")] = order_id
+            user_states[_uid(user_id, "reply_kind")] = "dispute_seller"
+            await call.message.edit_text(
+                "Вы открываете спор по заказу. Опишите причину:\n\nОтправьте «назад» для отмены.",
+                reply_markup=keyboards.create_back_button_menu(f"order_detail_{order_id}")
+            )
+
+        # ── Редактирование цифрового контента товара ──
+        elif data.startswith("digital_menu_"):
+            parts = data.split("_")
+            product_id  = int(parts[2])
+            category_id = int(parts[3])
+            page        = int(parts[4])
+            info = await database.get_product_digital(product_id) or {}
+            kind = info.get("kind") or "—"
+            content = info.get("content") or "не задано"
+            ttl = info.get("ttl_hours")
+            preview = content if isinstance(content, str) and len(content) < 120 else (str(content)[:117] + "...")
+            text = (
+                f"💾 <b>Цифровой контент</b>\n\n"
+                f"Тип: <code>{kind}</code>\n"
+                f"Содержимое: {preview}\n"
+                f"Срок действия: {f'{ttl} ч' if ttl else 'не задан'}\n\n"
+                "Контент будет автоматически отправлен покупателю после оплаты."
+            )
+            await call.message.edit_text(
+                text, reply_markup=keyboards.create_digital_content_menu(product_id, category_id, page),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data.startswith("edit_digital_"):
+            parts = data.split("_")
+            product_id = int(parts[2])
+            user_states[user_id] = UserState.EDITING_DIGITAL_CONTENT
+            user_states[_uid(user_id, "product_id")] = product_id
+            await call.message.edit_text(
+                "📝 Отправьте цифровой контент товара (будет автоматически отправлен покупателю после оплаты):\n\n"
+                "• Текст — любое сообщение\n"
+                "• Ссылка — https://...\n"
+                "• Файл/фото — отправьте вложение\n\n"
+                "Отправьте «назад» для отмены."
+            )
+
+        elif data.startswith("edit_dttl_"):
+            parts = data.split("_")
+            product_id = int(parts[2])
+            user_states[user_id] = UserState.EDITING_DIGITAL_TTL
+            user_states[_uid(user_id, "product_id")] = product_id
+            await call.message.edit_text(
+                "⏰ Введите срок действия цифрового контента в часах (целое число ≥ 0).\n"
+                "Отправьте 0 или «убрать» чтобы убрать срок."
+            )
+
+        elif data.startswith("clear_digital_"):
+            parts = data.split("_")
+            product_id = int(parts[2])
+            await database.update_product_digital(product_id, None, None, None)
+            await call.answer("✅ Цифровой контент очищен")
+
+        # ── МОДЕРАЦИЯ ──
+        elif data == "moderation_main":
+            if not config.is_moderator(user_id):
+                await call.answer("⛔ Нет прав")
+                return
+            await call.message.edit_text(
+                "🛡️ <b>Панель модерации</b>\n\nВыберите раздел:",
+                reply_markup=keyboards.create_moderation_main_menu(),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data == "mod_under_review":
+            if not config.is_moderator(user_id):
+                await call.answer("⛔ Нет прав")
+                return
+            shops = await database.get_shops_under_review()
+            if not shops:
+                await call.message.edit_text(
+                    "🔍 Магазинов на проверке нет.",
+                    reply_markup=keyboards.create_back_button_menu("moderation_main")
+                )
+                return
+            await call.message.edit_text(
+                f"🔍 Магазины на проверке: {len(shops)}",
+                reply_markup=keyboards.create_under_review_list_menu(shops)
+            )
+
+        elif data.startswith("mod_shop_clear_"):
+            if not config.is_moderator(user_id):
+                await call.answer("⛔ Нет прав")
+                return
+            shop_id = int(data.split("_")[-1])
+            await database.set_shop_status(shop_id, database.SHOP_STATUS_ACTIVE, None)
+            await database.resolve_complaints(shop_id, "dismissed")
+            await call.answer("✅ Магазин снят с проверки")
+            shops = await database.get_shops_under_review()
+            if not shops:
+                await call.message.edit_text(
+                    "🔍 Магазинов на проверке нет.",
+                    reply_markup=keyboards.create_back_button_menu("moderation_main")
+                )
+            else:
+                await call.message.edit_text(
+                    f"🔍 Магазины на проверке: {len(shops)}",
+                    reply_markup=keyboards.create_under_review_list_menu(shops)
+                )
+
+        elif data.startswith("mod_shop_delete_"):
+            if not config.is_owner(user_id):
+                await call.answer("⛔ Удалять магазины может только владелец")
+                return
+            shop_id = int(data.split("_")[-1])
+            shop_info = await database.get_shop_info(shop_id)
+            await database.delete_shop(shop_id)
+            await _stop_shop_bot(shop_id)
+            await call.answer("✅ Магазин удалён")
+            if shop_info:
+                try:
+                    await bot.send_message(
+                        shop_info[1],
+                        f"⚠️ Ваш магазин «{shop_info[2]}» был удалён модерацией после проверки жалоб."
+                    )
+                except Exception:
+                    pass
+            shops = await database.get_shops_under_review()
+            if not shops:
+                await call.message.edit_text(
+                    "🔍 Магазинов на проверке нет.",
+                    reply_markup=keyboards.create_back_button_menu("moderation_main")
+                )
+            else:
+                await call.message.edit_text(
+                    f"🔍 Магазины на проверке: {len(shops)}",
+                    reply_markup=keyboards.create_under_review_list_menu(shops)
+                )
+
+        elif data.startswith("mod_shop_") and not data.startswith("mod_shop_clear_") and not data.startswith("mod_shop_delete_"):
+            if not config.is_moderator(user_id):
+                await call.answer("⛔ Нет прав")
+                return
+            shop_id = int(data.split("_")[-1])
+            shop_info = await database.get_shop_info(shop_id)
+            if not shop_info:
+                await call.answer("Магазин не найден")
+                return
+            complaints = await database.get_open_complaints(shop_id)
+            text = f"🏪 <b>{shop_info[2]}</b>\nОткрытых жалоб: {len(complaints)}\n\n"
+            for cid, cuser, reason, created, uname in complaints[:10]:
+                who = f"@{uname}" if uname else f"id={cuser}"
+                text += f"• #{cid} от {who} ({created}):\n  {reason}\n\n"
+            await call.message.edit_text(
+                text, reply_markup=keyboards.create_moderation_shop_menu(shop_id, config.is_owner(user_id)),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data == "mod_open_disputes":
+            if not config.is_moderator(user_id):
+                await call.answer("⛔ Нет прав")
+                return
+            disputes = await database.get_open_disputes()
+            if not disputes:
+                await call.message.edit_text(
+                    "⚖️ Открытых споров нет.",
+                    reply_markup=keyboards.create_back_button_menu("moderation_main")
+                )
+                return
+            await call.message.edit_text(
+                f"⚖️ Открытых споров: {len(disputes)}",
+                reply_markup=keyboards.create_open_disputes_menu(disputes)
+            )
+
+        elif data.startswith("mod_dispute_") and not data.startswith("mod_disp_resolve_"):
+            if not config.is_moderator(user_id):
+                await call.answer("⛔ Нет прав")
+                return
+            dispute_id = int(data.split("_")[-1])
+            d = await database.get_dispute(dispute_id)
+            if not d:
+                await call.answer("Спор не найден")
+                return
+            order = await database.get_order(d["order_id"])
+            messages = await database.get_dispute_messages(dispute_id)
+            text = (
+                f"⚖️ <b>Спор #{dispute_id}</b> по заказу #{d['order_id']}\n"
+                f"Магазин: {d['shop_name']}\n"
+                f"Открыл: {d['opener_role']} (id={d['opened_by']})\n"
+                f"Причина: {d['reason']}\n\n"
+            )
+            if order:
+                text += (
+                    f"Товар: {order['product_name']}\n"
+                    f"Кол-во: {order['quantity']}\n"
+                    f"Сумма: {order['total_price']}₽\n"
+                    f"Статус заказа: {database.ORDER_STATUS_LABELS.get(order['status'], order['status'])}\n\n"
+                )
+            if messages:
+                text += "<b>Сообщения спора:</b>\n"
+                for aid, role, body, created in messages[-10:]:
+                    text += f"• [{role}] {body}\n"
+            await call.message.edit_text(
+                text, reply_markup=keyboards.create_dispute_resolution_menu(dispute_id),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data.startswith("mod_disp_resolve_"):
+            if not config.is_moderator(user_id):
+                await call.answer("⛔ Нет прав")
+                return
+            parts = data.split("_")
+            dispute_id = int(parts[3])
+            resolution = parts[4]
+            ok = await database.resolve_dispute(dispute_id, user_id, resolution, None)
+            if not ok:
+                await call.answer("Не удалось разрешить")
+                return
+            await call.answer("✅ Спор разрешён")
+            await _notify_dispute_resolved(dispute_id, resolution)
+            disputes = await database.get_open_disputes()
+            if not disputes:
+                await call.message.edit_text(
+                    "⚖️ Открытых споров нет.",
+                    reply_markup=keyboards.create_back_button_menu("moderation_main")
+                )
+            else:
+                await call.message.edit_text(
+                    f"⚖️ Открытых споров: {len(disputes)}",
+                    reply_markup=keyboards.create_open_disputes_menu(disputes)
+                )
+
+        # ── Правила (клики) ──
+        elif data == "terms_show":
+            await call.message.edit_text(
+                legal.TERMS_OF_USE,
+                reply_markup=keyboards.create_terms_back_menu("terms_back"),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data == "terms_legal":
+            await call.message.edit_text(
+                legal.PROHIBITED_GOODS,
+                reply_markup=keyboards.create_terms_back_menu("terms_back"),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data == "terms_back":
+            await call.message.edit_text(
+                f"👋 Для продолжения примите Правила платформы.\n\n{legal.DISCLAIMER_SHORT}",
+                reply_markup=keyboards.create_terms_acceptance_menu(),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data == "terms_accept":
+            await database.accept_terms(user_id, legal.TERMS_VERSION)
+            user_states[user_id] = UserState.MAIN_MENU
+            await call.message.edit_text(
+                "✅ Спасибо! Правила приняты.\n\n" + WELCOME_TEXT,
+                reply_markup=keyboards.create_main_menu()
+            )
 
         # ── Рассылка ──
         elif data.startswith("broadcast_"):
@@ -1361,6 +1725,249 @@ async def handle_edit_product_photo(message: Message):
     await message.answer("📦 Товары в разделе:",
                          reply_markup=await keyboards.create_products_menu(category_id, page))
     user_states[user_id] = UserState.SHOP_MENU
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Хелперы: форматирование/уведомления заказов и споров
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _format_order_for_admin(order: dict) -> str:
+    label = database.ORDER_STATUS_LABELS.get(order["status"], order["status"])
+    digital_mark = " 💾 (цифровой)" if order["is_digital"] else " 📦 (физический)"
+    customer = ("@" + order["username"]) if order.get("username") else f"id={order['customer_user_id']}"
+    text = (
+        f"📋 <b>Заказ #{order['id']}</b>{digital_mark}\n"
+        f"Статус: {label}\n"
+        f"Покупатель: {customer}\n"
+        f"Товар: <b>{order['product_name']}</b>\n"
+        f"Кол-во: {order['quantity']}\n"
+        f"Сумма: {order['total_price']}₽\n"
+        f"Способ оплаты: {order['payment_method'] or 'не указан'}\n"
+        f"Адрес/контакт: {order['delivery_address']}\n"
+        f"Создан: {order['created_at']}\n"
+    )
+    if order.get("paid_at"):
+        text += f"Оплачен: {order['paid_at']}\n"
+    if order.get("delivered_at"):
+        text += f"Доставлен: {order['delivered_at']}\n"
+    if order.get("closed_at"):
+        text += f"Закрыт: {order['closed_at']}\n"
+    if order.get("delivery_payload"):
+        text += f"\n<b>Цифровой контент отправлен:</b>\n<code>{order['delivery_payload'][:300]}</code>\n"
+    if order.get("seller_note"):
+        text += f"\n<b>Заметка продавца:</b> {order['seller_note']}\n"
+    return text
+
+
+async def _send_via_shop_or_main(shop_id: int, customer_id: int, text: str,
+                                 photo_id: Optional[str] = None,
+                                 file_id: Optional[str] = None) -> bool:
+    """Пытается отправить от имени магазин-бота, иначе — от менеджера."""
+    sender = active_shop_bots.get(shop_id) or bot
+    try:
+        if photo_id:
+            await sender.send_photo(customer_id, photo_id, caption=text or None,
+                                    parse_mode=ParseMode.HTML)
+        elif file_id:
+            await sender.send_document(customer_id, file_id, caption=text or None,
+                                       parse_mode=ParseMode.HTML)
+        else:
+            await sender.send_message(customer_id, text, parse_mode=ParseMode.HTML)
+        return True
+    except Exception as e:
+        logger.error(f"Не удалось отправить покупателю {customer_id} (магазин {shop_id}): {e}")
+        return False
+
+
+async def _notify_customer_status_change(order_id: int, new_status: str) -> None:
+    order = await database.get_order(order_id)
+    if not order:
+        return
+    label = database.ORDER_STATUS_LABELS.get(new_status, new_status)
+    msg = (
+        f"🔔 Статус заказа #{order_id} обновлён: <b>{label}</b>\n"
+        f"Магазин: {order['shop_name']}\n"
+        f"Товар: {order['product_name']} ×{order['quantity']}"
+    )
+    await _send_via_shop_or_main(order["shop_id"], order["customer_user_id"], msg)
+
+
+async def _deliver_digital_content(order: dict) -> bool:
+    """Отправляет цифровой контент покупателю и помечает заказ как `delivered`."""
+    digital_kind = order.get("digital_content_kind")
+    digital      = order.get("digital_content")
+    ttl_hours    = order.get("digital_ttl_hours")
+    if not digital:
+        return False
+    payload_for_log = f"[{digital_kind}] {digital[:200]}"
+    text = f"📤 <b>Ваш товар:</b> {order['product_name']}\n"
+    if ttl_hours:
+        text += f"⏰ Срок действия: {ttl_hours} ч с момента оплаты.\n"
+    text += "\n"
+    photo_id = file_id = None
+    if digital_kind == "text":
+        text += digital
+    elif digital_kind == "url":
+        text += f"🔗 {digital}"
+    elif digital_kind == "photo_id":
+        photo_id = digital
+    elif digital_kind == "file_id":
+        file_id = digital
+    else:
+        text += digital  # fallback
+    sent = await _send_via_shop_or_main(order["shop_id"], order["customer_user_id"],
+                                        text, photo_id=photo_id, file_id=file_id)
+    if sent:
+        await database.set_order_delivery_payload(order["id"], payload_for_log)
+        await database.update_order_status(order["id"], database.ORDER_STATUS_DELIVERED)
+    return sent
+
+
+async def _notify_dispute_resolved(dispute_id: int, resolution: str) -> None:
+    d = await database.get_dispute(dispute_id)
+    if not d:
+        return
+    order = await database.get_order(d["order_id"])
+    if not order:
+        return
+    res_label = {
+        "refund":   "💸 решено в пользу покупателя — возврат средств",
+        "complete": "✅ решено в пользу продавца — заказ завершён",
+        "reject":   "⛔ спор отклонён модерацией",
+    }.get(resolution, resolution)
+    customer_msg = (
+        f"⚖️ Спор #{dispute_id} по заказу #{order['id']} закрыт:\n{res_label}\n\n"
+        f"Если решение — возврат, продавец оформит его в своём кабинете "
+        f"PayMaster/ЮKassa в течение 3 рабочих дней."
+    )
+    await _send_via_shop_or_main(d["shop_id"], order["customer_user_id"], customer_msg)
+    seller_id = (await database.get_shop_info(d["shop_id"]))[1]
+    try:
+        await bot.send_message(
+            seller_id,
+            f"⚖️ Спор #{dispute_id} по заказу #{order['id']} закрыт:\n{res_label}",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Сообщения: цифровой контент, TTL, ответы по заказу/спору
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_DIGITAL_CONTENT))
+async def handle_edit_digital_content(message: Message):
+    user_id    = message.from_user.id
+    product_id = user_states.get(_uid(user_id, "product_id"))
+    if not product_id:
+        user_states[user_id] = UserState.SHOP_MENU
+        return
+    text = (message.text or "").strip()
+    if text.lower() == "назад":
+        user_states[user_id] = UserState.SHOP_MENU
+        await message.answer("❌ Отменено")
+        return
+
+    kind = content = None
+    if message.photo:
+        kind, content = "photo_id", message.photo[-1].file_id
+    elif message.document:
+        kind, content = "file_id", message.document.file_id
+    elif text:
+        if text.lower().startswith(("http://", "https://", "tg://")):
+            kind, content = "url", text
+        else:
+            kind, content = "text", text
+    if not kind:
+        await message.answer("❌ Отправьте текст, ссылку или вложение")
+        return
+
+    await database.update_product_digital(product_id, kind, content,
+                                          (await database.get_product_digital(product_id) or {}).get("ttl_hours"))
+    user_states[user_id] = UserState.SHOP_MENU
+    await message.answer(f"✅ Цифровой контент сохранён ({kind})")
+
+
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_DIGITAL_TTL))
+async def handle_edit_digital_ttl(message: Message):
+    user_id    = message.from_user.id
+    product_id = user_states.get(_uid(user_id, "product_id"))
+    if not product_id:
+        user_states[user_id] = UserState.SHOP_MENU
+        return
+    text = (message.text or "").strip().lower()
+    if text in ("назад", "убрать", ""):
+        await database.update_product_digital(
+            product_id,
+            (await database.get_product_digital(product_id) or {}).get("kind"),
+            (await database.get_product_digital(product_id) or {}).get("content"),
+            None
+        )
+        user_states[user_id] = UserState.SHOP_MENU
+        await message.answer("✅ Срок действия убран")
+        return
+    try:
+        ttl = int(text)
+        if ttl < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число ≥ 0")
+        return
+    info = await database.get_product_digital(product_id) or {}
+    await database.update_product_digital(product_id, info.get("kind"), info.get("content"),
+                                          ttl if ttl > 0 else None)
+    user_states[user_id] = UserState.SHOP_MENU
+    await message.answer("✅ Срок действия сохранён" if ttl > 0 else "✅ Срок действия убран")
+
+
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.REPLYING_DISPUTE))
+async def handle_admin_reply(message: Message):
+    user_id   = message.from_user.id
+    order_id  = user_states.get(_uid(user_id, "reply_order_id"))
+    kind      = user_states.get(_uid(user_id, "reply_kind"), "order")
+    text      = (message.text or "").strip()
+
+    if text.lower() == "назад":
+        user_states[user_id] = UserState.SHOP_MENU
+        user_states.pop(_uid(user_id, "reply_order_id"), None)
+        user_states.pop(_uid(user_id, "reply_kind"), None)
+        await message.answer("❌ Отменено")
+        return
+    if not order_id or not text:
+        await message.answer("❌ Пустое сообщение")
+        return
+
+    order = await database.get_order(order_id)
+    if not order:
+        await message.answer("❌ Заказ не найден")
+        user_states[user_id] = UserState.SHOP_MENU
+        return
+
+    if kind == "dispute_seller":
+        did = await database.open_dispute(order_id, user_id, "seller", text)
+        if not did:
+            await message.answer("❌ Не удалось открыть спор")
+            user_states[user_id] = UserState.SHOP_MENU
+            return
+        await database.add_dispute_message(did, user_id, "seller", text)
+        await _send_via_shop_or_main(
+            order["shop_id"], order["customer_user_id"],
+            f"⚖️ Продавец открыл спор по заказу #{order_id}:\n{text}\n\n"
+            f"Откройте «Мои заказы» в магазине для ответа."
+        )
+        await message.answer(f"✅ Спор #{did} открыт")
+    else:
+        # Обычное сообщение продавец → покупатель
+        await _send_via_shop_or_main(
+            order["shop_id"], order["customer_user_id"],
+            f"💬 Сообщение от продавца по заказу #{order_id}:\n{text}"
+        )
+        await message.answer("✅ Сообщение отправлено покупателю")
+
+    user_states[user_id] = UserState.SHOP_MENU
+    user_states.pop(_uid(user_id, "reply_order_id"), None)
+    user_states.pop(_uid(user_id, "reply_kind"), None)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
