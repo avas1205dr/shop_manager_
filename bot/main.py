@@ -280,6 +280,17 @@ async def show_manager_product(call: CallbackQuery):
 async def callback_handler(call: CallbackQuery):
     user_id = call.from_user.id
     data    = call.data
+    # Кнопки в чате, у которых в callback_data попало литеральное "None"
+    # (баг старых рендеров меню до фикса EDITING_PRODUCT) при клике падали
+    # с `invalid literal for int() with base 10: 'None'`. Перехватываем
+    # такие кнопки и показываем понятное сообщение, чтобы пользователь
+    # не получал «Произошла ошибка. Попробуйте снова.» вечно.
+    if data and "_None_" in f"_{data}_":
+        await call.answer(
+            "Эта кнопка устарела. Откройте раздел заново из главного меню.",
+            show_alert=True
+        )
+        return
     try:
         # ── Главное меню ──
         if data == "main_menu":
@@ -632,7 +643,16 @@ async def callback_handler(call: CallbackQuery):
             product_id  = int(parts[1])
             category_id = int(parts[2])
             page        = int(parts[3])
-            user_states[user_id] = UserState.EDITING_PRODUCT
+            user_states[user_id]                      = UserState.EDITING_PRODUCT
+            # Раньше тут НЕ записывались product_id/category_id/page в user_states.
+            # Из-за этого, если пользователь после открытия товара отправлял
+            # любой текст, ветка `EDITING_PRODUCT` в handle_messages читала None
+            # и строила меню с callback_data вида `digital_menu_None_None_0`,
+            # который при следующем клике падал с
+            # `invalid literal for int() with base 10: 'None'`.
+            user_states[_uid(user_id, "product_id")]  = product_id
+            user_states[_uid(user_id, "category_id")] = category_id
+            user_states[_uid(user_id, "page")]        = page
             await call.message.edit_text(
                 "Выберите действие:",
                 reply_markup=keyboards.create_edit_product_menu(product_id, category_id, page)
@@ -1944,6 +1964,18 @@ async def text_handler(message: Message):
         product_id  = user_states.get(_uid(user_id, "product_id"))
         category_id = user_states.get(_uid(user_id, "category_id"))
         page        = user_states.get(_uid(user_id, "page"), 0)
+
+        # Если контекст редактирования потерялся (бот перезапустился, состояние
+        # испортилось и т.п.), не строим меню с callback_data вроде
+        # `digital_menu_None_None_0` — оно потом падает при клике.
+        if product_id is None or category_id is None:
+            user_states[user_id] = UserState.MAIN_MENU
+            _clear_product_state(user_id)
+            await message.answer(
+                "⚠️ Сессия редактирования товара истекла. Откройте товар из списка заново.",
+                reply_markup=keyboards.create_main_menu()
+            )
+            return
 
         if message.text and message.text.strip().lower() == 'назад':
             await message.answer("❌ Изменение товара отменено")
