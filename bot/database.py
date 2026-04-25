@@ -1597,27 +1597,24 @@ async def resolve_dispute(dispute_id: int, resolved_by: int,
     dispute = await get_dispute(dispute_id)
     if not dispute or dispute["status"] != DISPUTE_STATUS_OPEN:
         return False
+    # Сначала фиксируем решение по самому спору.
     async with _db() as db:
         await db.execute(
             "UPDATE disputes SET status=?, resolution=?, resolution_note=?, "
             "resolved_by=?, closed_at=CURRENT_TIMESTAMP WHERE id=?",
             (DISPUTE_STATUS_RESOLVED, resolution, resolution_note, resolved_by, dispute_id)
         )
-        # Обновляем статус заказа в зависимости от решения
-        if resolution == "refund":
-            new_status = ORDER_STATUS_REFUNDED
-        elif resolution == "complete":
-            new_status = ORDER_STATUS_COMPLETED
-        else:  # reject
-            # Возвращаем заказ к paid если был оплачен, иначе new
-            new_status = ORDER_STATUS_PAID
-        await db.execute(
-            "UPDATE orders SET status=?, updated_at=CURRENT_TIMESTAMP, "
-            "closed_at=CASE WHEN ? IN ('completed','refunded') THEN CURRENT_TIMESTAMP "
-            "ELSE closed_at END WHERE id=?",
-            (new_status, new_status, dispute["order_id"])
-        )
         await db.commit()
+    # Дальше меняем статус заказа ЧЕРЕЗ update_order_status — там зашита
+    # финансовая логика (списание баланса продавца при возврате,
+    # начисление при PAID и т.п.). Прямой UPDATE по orders ломал бы баланс.
+    if resolution == "refund":
+        new_status = ORDER_STATUS_REFUNDED
+    elif resolution == "complete":
+        new_status = ORDER_STATUS_COMPLETED
+    else:  # reject
+        new_status = ORDER_STATUS_PAID
+    await update_order_status(dispute["order_id"], new_status)
     return True
 
 
