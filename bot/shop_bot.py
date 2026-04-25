@@ -426,6 +426,42 @@ async def run_shop_bot(
             await database.use_promocode(promo['id'])
             states.pop(f"{customer_id}_promo", None)
 
+        # Если итог после промокода ниже минимальной суммы Telegram Payments
+        # (1 ₽ = 100 коп.), invoice через менеджер-бот выставить нельзя —
+        # _send_payment_invoice_group отказал бы, оставив заказы навсегда в
+        # NEW. Поэтому обрабатываем как free order: PAID + payment_method=
+        # 'promocode' (баланс продавцу не зачисляется, см. place_cart_order).
+        if payment_method == 'online' and total_price < 1.0:
+            group_id, order_ids = await database.place_cart_order(
+                shop_id, customer_id, items, total_price, delivery_address,
+                status=database.ORDER_STATUS_PAID, payment_method='promocode'
+            )
+            admin_ids = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
+            free_notify_txt = (
+                f"🎉 Заказ оформлен бесплатно по промокоду!\n\n"
+                f"Магазин: {shop_info[2]}\n{order_details}\n"
+                f"💰 Итог: {total_price:.2f}₽\n🏠 Адрес: {delivery_address}\n"
+                f"👤 Покупатель: @{message.from_user.username or 'Не указан'}\n"
+                f"💳 Способ оплаты: {database.payment_method_label('promocode')}"
+            )
+            for aid in set(admin_ids):
+                try:
+                    await manager_bot.send_message(aid, free_notify_txt)
+                except Exception:
+                    pass
+            await message.answer(
+                f"🎉 Заказ оформлен бесплатно по промокоду!\n\n{order_details}\n"
+                f"🏠 Адрес: {delivery_address}\n\n"
+                f"Раздел «📋 Мои заказы» — для отслеживания статуса."
+            )
+            for oid in order_ids:
+                order = await database.get_order(oid)
+                if order and order.get("digital_content"):
+                    await _deliver_digital(order, bot)
+            await database.clear_cart(shop_id, customer_id)
+            states[customer_id] = ShopBotState.MAIN_MENU
+            return
+
         # Cash → cразу processing+paid (продавец подтвердит при отгрузке);
         # online → new (станет paid после ручной отметки админом или вебхука)
         initial_status = (database.ORDER_STATUS_PROCESSING

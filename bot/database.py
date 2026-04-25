@@ -51,6 +51,7 @@ PAYMENT_METHOD_LABELS = {
     "online":             "💳 Онлайн через платформу",
     "platform_invoice":   "💳 Онлайн через платформу",
     "cash_on_delivery":   "💵 Оплата при получении",
+    "promocode":          "🎟️ Бесплатно по промокоду",
 }
 
 
