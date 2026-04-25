@@ -1059,7 +1059,7 @@ async def run_shop_bot(
 
     # ─── MESSAGE HANDLERS ───
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.ENTERING_QUANTITY))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.ENTERING_QUANTITY), ~F.successful_payment)
     async def handle_quantity_input(message: Message):
         user_id = message.from_user.id
         text    = message.text.strip()
@@ -1086,7 +1086,7 @@ async def run_shop_bot(
         builder.row(InlineKeyboardButton(text="⏭️ Пропустить", callback_data="skip_promo_direct"))
         await message.answer("🎟️ Введите промокод или нажмите «Пропустить»:", reply_markup=builder.as_markup())
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.ENTERING_PROMOCODE_DIRECT))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.ENTERING_PROMOCODE_DIRECT), ~F.successful_payment)
     async def handle_direct_promocode(message: Message):
         user_id = message.from_user.id
         code    = message.text.strip()
@@ -1117,7 +1117,7 @@ async def run_shop_bot(
             message.chat.id, user_id, product_id, quantity, shop_id, bot, states
         )
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.ENTERING_PROMOCODE))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.ENTERING_PROMOCODE), ~F.successful_payment)
     async def handle_promocode(message: Message):
         user_id = message.from_user.id
         code    = message.text.strip()
@@ -1140,7 +1140,7 @@ async def run_shop_bot(
             reply_markup=keyboards.create_back_button_menu("view_cart")
         )
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.ENTERING_ADDRESS))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.ENTERING_ADDRESS), ~F.successful_payment)
     async def handle_cart_address(message: Message):
         if message.text.strip().lower() == 'назад':
             states[message.from_user.id] = ShopBotState.VIEWING_CART
@@ -1148,7 +1148,7 @@ async def run_shop_bot(
             return
         await _handle_delivery_address_logic(message, message.from_user.id)
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.REVIEW_TEXT))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.REVIEW_TEXT), ~F.successful_payment)
     async def handle_review_text(message: Message):
         user_id = message.from_user.id
         text    = message.text.strip()
@@ -1171,7 +1171,7 @@ async def run_shop_bot(
         await message.answer("✅ Спасибо за ваш отзыв!", reply_markup=_create_shop_main_menu())
         states[user_id] = ShopBotState.MAIN_MENU
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.SEARCH_INPUT))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.SEARCH_INPUT), ~F.successful_payment)
     async def handle_search_input(message: Message):
         user_id = message.from_user.id
         query   = message.text.strip()
@@ -1197,7 +1197,7 @@ async def run_shop_bot(
         text, markup = _products_list_text_markup(results, "Результаты поиска", "shop_search")
         await message.answer(text, reply_markup=markup)
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.FILTER_MIN_PRICE))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.FILTER_MIN_PRICE), ~F.successful_payment)
     async def handle_filter_min_price(message: Message):
         user_id = message.from_user.id
         text    = message.text.strip()
@@ -1219,7 +1219,7 @@ async def run_shop_bot(
         except ValueError:
             await message.answer("Некорректная цена. Введите положительное число или «назад».")
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.FILTER_MAX_PRICE))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.FILTER_MAX_PRICE), ~F.successful_payment)
     async def handle_filter_max_price(message: Message):
         user_id = message.from_user.id
         text    = message.text.strip()
@@ -1260,7 +1260,7 @@ async def run_shop_bot(
 
     # ─── Новые состояния: жалоба, возврат, спор ───
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.COMPLAINT_REASON))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.COMPLAINT_REASON), ~F.successful_payment)
     async def handle_complaint_reason(message: Message):
         user_id = message.from_user.id
         text = (message.text or "").strip()
@@ -1307,7 +1307,7 @@ async def run_shop_bot(
             except Exception:
                 pass
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.REFUND_REASON))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.REFUND_REASON), ~F.successful_payment)
     async def handle_refund_reason(message: Message):
         user_id  = message.from_user.id
         order_id = states.get(f"{user_id}_refund_order_id")
@@ -1344,7 +1344,7 @@ async def run_shop_bot(
             except Exception:
                 pass
 
-    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.DISPUTE_REASON))
+    @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.DISPUTE_REASON), ~F.successful_payment)
     async def handle_dispute_reason(message: Message):
         user_id  = message.from_user.id
         order_id = states.get(f"{user_id}_dispute_order_id")

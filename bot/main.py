@@ -1387,7 +1387,7 @@ async def execute_broadcast(message: Message):
     user_states[user_id] = UserState.SHOP_MENU
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.ADDING_WORKER))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.ADDING_WORKER), ~F.successful_payment)
 async def add_worker_handler(message: Message):
     user_id     = message.from_user.id
     shop_id     = user_states.get(_uid(user_id, "shop_id"))
@@ -1459,7 +1459,7 @@ async def add_worker_handler(message: Message):
     user_states[user_id] = UserState.SHOP_MENU
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_PAYMASTER))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_PAYMASTER), ~F.successful_payment)
 async def save_paymaster_token(message: Message):
     user_id = message.from_user.id
     shop_id = user_states.get(_uid(user_id, "shop_id"))
@@ -1481,7 +1481,7 @@ async def save_paymaster_token(message: Message):
     user_states[user_id] = UserState.SHOP_MENU
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_AMOUNT))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_AMOUNT), ~F.successful_payment)
 async def handle_withdraw_amount(message: Message):
     user_id = message.from_user.id
     shop_id = user_states.get(_uid(user_id, "shop_id"))
@@ -1522,7 +1522,7 @@ async def handle_withdraw_amount(message: Message):
     )
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_REQUISITES))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_REQUISITES), ~F.successful_payment)
 async def handle_withdraw_requisites(message: Message):
     user_id = message.from_user.id
     shop_id = user_states.get(_uid(user_id, "shop_id"))
@@ -1583,7 +1583,7 @@ async def handle_withdraw_requisites(message: Message):
             logger.error(f"Не удалось уведомить OWNER {owner_id} о выводе #{wid}: {e}")
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_REJECT_NOTE))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_REJECT_NOTE), ~F.successful_payment)
 async def handle_withdraw_reject_note(message: Message):
     user_id = message.from_user.id
     if not config.is_owner(user_id):
@@ -1614,7 +1614,7 @@ async def handle_withdraw_reject_note(message: Message):
             pass
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_PAYMENT))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_PAYMENT), ~F.successful_payment)
 async def save_payment_credentials(message: Message):
     user_id     = message.from_user.id
     shop_id     = user_states.get(_uid(user_id, "shop_id"))
@@ -1634,7 +1634,7 @@ async def save_payment_credentials(message: Message):
     user_states[user_id] = UserState.SHOP_MENU
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.ADDING_PROMO_CODE))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.ADDING_PROMO_CODE), ~F.successful_payment)
 async def handle_promo_code_input(message: Message):
     user_id = message.from_user.id
     shop_id = user_states.get(_uid(user_id, "shop_id"))
@@ -1660,7 +1660,7 @@ async def handle_promo_code_input(message: Message):
     )
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.ADDING_PROMO_VALUE))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.ADDING_PROMO_VALUE), ~F.successful_payment)
 async def handle_promo_value_input(message: Message):
     user_id = message.from_user.id
     shop_id = user_states.get(_uid(user_id, "shop_id"))
@@ -2289,7 +2289,7 @@ async def _notify_dispute_resolved(dispute_id: int, resolution: str) -> None:
 #  Сообщения: цифровой контент, TTL, ответы по заказу/спору
 # ──────────────────────────────────────────────────────────────────────────────
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_DIGITAL_CONTENT))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_DIGITAL_CONTENT), ~F.successful_payment)
 async def handle_edit_digital_content(message: Message):
     user_id    = message.from_user.id
     product_id = user_states.get(_uid(user_id, "product_id"))
@@ -2341,7 +2341,7 @@ async def handle_edit_digital_content(message: Message):
     await message.answer(f"✅ Цифровой контент сохранён ({kind})")
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_DIGITAL_TTL))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_DIGITAL_TTL), ~F.successful_payment)
 async def handle_edit_digital_ttl(message: Message):
     user_id    = message.from_user.id
     product_id = user_states.get(_uid(user_id, "product_id"))
@@ -2373,7 +2373,7 @@ async def handle_edit_digital_ttl(message: Message):
     await message.answer("✅ Срок действия сохранён" if ttl > 0 else "✅ Срок действия убран")
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.REPLYING_DISPUTE))
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.REPLYING_DISPUTE), ~F.successful_payment)
 async def handle_admin_reply(message: Message):
     user_id   = message.from_user.id
     order_id  = user_states.get(_uid(user_id, "reply_order_id"))
