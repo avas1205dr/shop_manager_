@@ -1813,25 +1813,42 @@ async def create_withdrawal(shop_id: int, seller_user_id: int,
 
     Возвращает id записи или None, если средств не хватает / валидация не прошла.
     Статус выставляется сразу 'approved' (по решению пользователя — авто-одобрение).
+
+    Списание баланса и вставка в `withdrawals` выполняются в одной
+    транзакции SQLite (один commit). Иначе при сбое после успешного
+    debit'а строка вывода не появилась бы — деньги «потерялись» бы у
+    продавца без следа.
     """
     if method not in WITHDRAWAL_METHODS:
         return None
     requisites = (requisites or "").strip()
     if len(requisites) < 4:
         return None
+    if not isinstance(shop_id, int) or shop_id <= 0:
+        return None
     kop = _rub_to_kop(amount_rub)
     if kop <= 0:
         return None
-    # Сначала пытаемся списать; если не хватило — отбой.
-    if not await debit_seller_balance(shop_id, kop):
-        return None
     async with _db() as db:
+        # Атомарный debit: UPDATE ... WHERE amount_kopecks>=? — либо успешно
+        # снимает (rowcount>0), либо средств не хватило (rowcount==0).
         async with db.execute(
-            "INSERT INTO withdrawals (shop_id, seller_user_id, amount_kopecks, method, requisites, status) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "UPDATE seller_balances SET amount_kopecks=amount_kopecks-?, "
+            "updated_at=CURRENT_TIMESTAMP "
+            "WHERE shop_id=? AND amount_kopecks>=?",
+            (kop, shop_id, kop)
+        ) as cur:
+            if cur.rowcount <= 0:
+                # Средств не хватает — НИЧЕГО не комитим, выходим.
+                return None
+        # В той же транзакции создаём запись о выводе.
+        async with db.execute(
+            "INSERT INTO withdrawals (shop_id, seller_user_id, amount_kopecks, "
+            "method, requisites, status) VALUES (?, ?, ?, ?, ?, ?)",
             (shop_id, seller_user_id, kop, method, requisites, WITHDRAWAL_STATUS_APPROVED)
         ) as cur:
             wid = cur.lastrowid
+        # Commit делаем один раз — либо обе операции применятся, либо ни одна.
         await db.commit()
     return wid
 

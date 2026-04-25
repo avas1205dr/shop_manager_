@@ -418,6 +418,17 @@ async def run_shop_bot(
             total_price   += price * quantity
             order_details += f"📦 {name} ×{quantity} — {price * quantity}₽\n"
 
+        # Если оплата онлайн, но платёжный токен или username менеджер-бота
+        # не настроены — отказать ДО списания промокода и создания заказов,
+        # иначе промо «сгорит», а заказы повиснут в NEW без возможности оплатить.
+        if (payment_method == 'online'
+                and (not config.PAYMENTS_TOKEN or not config.MANAGER_BOT_USERNAME)):
+            await message.answer(
+                "❌ Онлайн-оплата временно недоступна (платформа не настроена).\n"
+                "Свяжитесь с продавцом или попробуйте позже."
+            )
+            return
+
         promo = states.get(f"{customer_id}_promo")
         if promo:
             discounted  = _apply_promo(total_price, promo)
@@ -461,27 +472,22 @@ async def run_shop_bot(
             # (5 товаров → 5 переходов в менеджер-бота → 5 invoice'ов). Теперь
             # делаем один общий deeplink на group_id; в менеджер-боте по нему
             # формируется один invoice со списком позиций.
-            if not config.PAYMENTS_TOKEN or not config.MANAGER_BOT_USERNAME:
-                await message.answer(
-                    f"🛒 Заказ оформлен!\n\n{order_details}\n"
-                    f"💰 Итог: {total_price:.2f}₽\n🏠 Адрес: {delivery_address}\n\n"
-                    f"❌ Онлайн-оплата временно недоступна. Свяжитесь с продавцом."
-                )
-            else:
-                pay_url = f"https://t.me/{config.MANAGER_BOT_USERNAME}?start=pay_g_{group_id}"
-                builder = InlineKeyboardBuilder()
-                builder.row(InlineKeyboardButton(
-                    text=f"💳 Оплатить корзину — {total_price:.2f} ₽",
-                    url=pay_url
-                ))
-                await message.answer(
-                    f"🛒 Заказ оформлен!\n\n{order_details}\n"
-                    f"💰 Итог: {total_price:.2f}₽\n🏠 Адрес: {delivery_address}\n\n"
-                    f"Нажмите кнопку оплаты ниже — вы перейдёте в платёжный бот платформы "
-                    f"и оплатите корзину одним счётом. После оплаты статусы заказов "
-                    f"автоматически станут «оплачено».",
-                    reply_markup=builder.as_markup()
-                )
+            # Доступность PAYMENTS_TOKEN/MANAGER_BOT_USERNAME проверена выше до
+            # списания промокода и создания заказов.
+            pay_url = f"https://t.me/{config.MANAGER_BOT_USERNAME}?start=pay_g_{group_id}"
+            builder = InlineKeyboardBuilder()
+            builder.row(InlineKeyboardButton(
+                text=f"💳 Оплатить корзину — {total_price:.2f} ₽",
+                url=pay_url
+            ))
+            await message.answer(
+                f"🛒 Заказ оформлен!\n\n{order_details}\n"
+                f"💰 Итог: {total_price:.2f}₽\n🏠 Адрес: {delivery_address}\n\n"
+                f"Нажмите кнопку оплаты ниже — вы перейдёте в платёжный бот платформы "
+                f"и оплатите корзину одним счётом. После оплаты статусы заказов "
+                f"автоматически станут «оплачено».",
+                reply_markup=builder.as_markup()
+            )
         else:
             await message.answer(
                 f"🛒 Заказ оформлен!\n\n{order_details}\n"
