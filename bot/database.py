@@ -300,6 +300,30 @@ def init_database():
         c.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('balances_backfilled', '1')")
         conn.commit()
 
+    # Одноразовая миграция: проставить is_digital=1 у товаров, у которых
+    # уже настроен цифровой контент. Раньше update_product_digital писал
+    # digital_content/kind/ttl_hours, но не трогал is_digital — поэтому
+    # «цифровые» товары визуально считались физическими, а кнопка «Выдать
+    # цифровой контент» в админке заказа не показывалась. Симметрично:
+    # если контент очищен (kind или content NULL), обнуляем is_digital в 0.
+    c.execute("SELECT value FROM db_meta WHERE key='is_digital_backfilled'")
+    row = c.fetchone()
+    if not row:
+        c.execute(
+            "UPDATE products SET is_digital=1 "
+            "WHERE digital_content IS NOT NULL AND digital_content_kind IS NOT NULL "
+            "AND (is_digital IS NULL OR is_digital=0)"
+        )
+        c.execute(
+            "UPDATE products SET is_digital=0 "
+            "WHERE (digital_content IS NULL OR digital_content_kind IS NULL) "
+            "AND is_digital=1"
+        )
+        c.execute(
+            "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('is_digital_backfilled', '1')"
+        )
+        conn.commit()
+
     conn.close()
 
 
