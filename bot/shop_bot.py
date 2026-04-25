@@ -276,11 +276,14 @@ async def _send_invoice_for_direct_buy(
             return
         await database.use_promocode(promo['id'])
 
-    payment_token = await database.get_paymaster_token_by_shop_id(shop_id)
+    # Все платежи идут через ЕДИНЫЙ PayMaster платформы (PAYMENTS_TOKEN из .env).
+    # Деньги попадают на счёт владельца платформы; продавцу зачисляется
+    # внутренний баланс, который он позже выводит запросом.
+    payment_token = config.PAYMENTS_TOKEN
     if not payment_token:
         await bot.send_message(
             chat_id,
-            "❌ Оплата не настроена. Обратитесь к администратору магазина.",
+            "❌ Оплата на платформе временно недоступна. Обратитесь в поддержку.",
             reply_markup=_create_shop_main_menu()
         )
         states[user_id] = ShopBotState.MAIN_MENU

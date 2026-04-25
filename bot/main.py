@@ -271,29 +271,169 @@ async def callback_handler(call: CallbackQuery):
         elif data.startswith("edit_token_"):
             shop_id   = int(data.split("_")[-1])
             shop_info = await database.get_shop_info(shop_id)
-            cur_token = shop_info[3] if shop_info and shop_info[3] else "Не установлен"
+            # Никогда не показываем токен полностью — только маску.
+            cur_token = config.mask_secret(shop_info[3]) if shop_info and shop_info[3] else "Не установлен"
             user_states[user_id]                  = UserState.EDITING_TOKEN
             user_states[_uid(user_id, "shop_id")] = shop_id
             await call.message.edit_text(
-                f"🔑 Токен API бота\n\nТекущий токен: {cur_token}\n\n"
-                f"Введите новый токен (минимум 30 символов):\n\nОтправьте 'назад' для отмены",
+                f"🔑 Токен API бота\n\nТекущий токен: <code>{cur_token}</code>\n\n"
+                f"Введите новый токен (минимум 30 символов):\n\n"
+                f"⚠️ Токен — секрет. Не пересылайте его в чаты. После сохранения "
+                f"в боте будет отображаться только маска.\n\n"
+                f"Отправьте 'назад' для отмены",
+                parse_mode=ParseMode.HTML,
                 reply_markup=keyboards.create_back_button_menu(f"manage_shop_{shop_id}")
             )
 
-        # ── PayMaster ──
+        # ── PayMaster (устарело: платежи теперь идут через PAYMENTS_TOKEN платформы) ──
         elif data.startswith("paymaster_token_"):
             shop_id = int(data.split("_")[-1])
-            user_states[user_id]                  = UserState.EDITING_PAYMASTER
-            user_states[_uid(user_id, "shop_id")] = shop_id
             await call.message.edit_text(
-                "💳 Настройка PayMaster:\n\n"
-                "1. Перейдите в @BotFather\n"
-                "2. Выберите вашего бота\n"
-                "3. Перейдите в раздел \"Payments\"\n"
-                "4. Выберите \"PayMaster\" как провайдера платежей\n"
-                "5. Скопируйте полученный токен\n\n"
-                "Отправьте токен в следующем сообщении или 'назад' для отмены:",
+                "ℹ️ Отдельная настройка PayMaster для каждого магазина больше не нужна.\n\n"
+                "Все платежи покупателей теперь идут через единый PayMaster платформы. "
+                "Деньги зачисляются на ваш внутренний баланс — выводите их в разделе "
+                "<b>«💰 Финансы»</b>.",
+                parse_mode=ParseMode.HTML,
                 reply_markup=keyboards.create_back_button_menu(f"manage_shop_{shop_id}")
+            )
+
+        # ── Финансы магазина (баланс + вывод) ──
+        elif data.startswith("finance_") and not data.startswith("finance_history_"):
+            shop_id = int(data.split("_")[-1])
+            shop_info = await database.get_shop_info(shop_id)
+            if not shop_info:
+                await call.answer("Магазин не найден", show_alert=True)
+                return
+            # Доступ только владельцу/админу магазина или OWNER_IDS.
+            admins = await database.get_shop_admins_ids(shop_id)
+            if user_id != shop_info[1] and user_id not in admins and not config.is_owner(user_id):
+                await call.answer("Нет доступа", show_alert=True)
+                return
+            bal = await database.get_seller_balance(shop_id)
+            text = (
+                f"💰 <b>Финансы — {shop_info[2]}</b>\n\n"
+                f"Доступно к выводу: <b>{bal['amount_rub']:.2f} ₽</b>\n"
+                f"Всего заработано: {bal['total_earned_rub']:.2f} ₽\n\n"
+                f"Минимальная сумма вывода: {config.MIN_WITHDRAWAL} ₽\n\n"
+                f"Платежи покупателей принимаются единым PayMaster платформы; "
+                f"фактическую выплату делает владелец платформы после вашего запроса."
+            )
+            await call.message.edit_text(text, parse_mode=ParseMode.HTML,
+                                         reply_markup=keyboards.create_finance_menu(shop_id))
+
+        # ── Запросить вывод: выбор способа ──
+        elif data.startswith("withdraw_start_"):
+            shop_id = int(data.split("_")[-1])
+            shop_info = await database.get_shop_info(shop_id)
+            if not shop_info or shop_info[1] != user_id:
+                await call.answer("Только владелец магазина может запросить вывод", show_alert=True)
+                return
+            bal = await database.get_seller_balance(shop_id)
+            if bal["amount_rub"] < config.MIN_WITHDRAWAL:
+                await call.answer(
+                    f"Минимум для вывода — {config.MIN_WITHDRAWAL} ₽. "
+                    f"На балансе: {bal['amount_rub']:.2f} ₽",
+                    show_alert=True
+                )
+                return
+            await call.message.edit_text(
+                f"💸 <b>Запрос на вывод</b>\n\nДоступно: {bal['amount_rub']:.2f} ₽\n\n"
+                f"Выберите способ получения:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.create_withdraw_method_menu(shop_id)
+            )
+
+        # ── Выбран способ → вводим реквизиты ──
+        elif data.startswith("withdraw_method_"):
+            parts = data.split("_")
+            shop_id = int(parts[2])
+            method  = parts[3]
+            shop_info = await database.get_shop_info(shop_id)
+            if not shop_info or shop_info[1] != user_id:
+                await call.answer("Нет доступа", show_alert=True)
+                return
+            if method not in database.WITHDRAWAL_METHODS:
+                await call.answer("Неизвестный способ", show_alert=True)
+                return
+            bal = await database.get_seller_balance(shop_id)
+            user_states[user_id] = UserState.WITHDRAW_AMOUNT
+            user_states[_uid(user_id, "shop_id")] = shop_id
+            user_states[_uid(user_id, "withdraw_method")] = method
+            await call.message.edit_text(
+                f"Способ: {database.WITHDRAWAL_METHOD_LABELS[method]}\n\n"
+                f"Доступно: <b>{bal['amount_rub']:.2f} ₽</b>\n"
+                f"Минимум: {config.MIN_WITHDRAWAL} ₽\n\n"
+                f"Введите сумму к выводу в рублях (целое число или с запятой), "
+                f"или отправьте 'назад' для отмены.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.create_back_button_menu(f"finance_{shop_id}")
+            )
+
+        # ── История выводов ──
+        elif data.startswith("withdraw_history_"):
+            shop_id = int(data.split("_")[-1])
+            shop_info = await database.get_shop_info(shop_id)
+            admins = await database.get_shop_admins_ids(shop_id)
+            if not shop_info or (user_id != shop_info[1] and user_id not in admins
+                                  and not config.is_owner(user_id)):
+                await call.answer("Нет доступа", show_alert=True)
+                return
+            rows = await database.list_shop_withdrawals(shop_id, limit=10)
+            if not rows:
+                text = "📜 История выводов пуста."
+            else:
+                lines = ["📜 <b>Последние выводы:</b>\n"]
+                for r in rows:
+                    label = database.WITHDRAWAL_STATUS_LABELS.get(r["status"], r["status"])
+                    method_label = database.WITHDRAWAL_METHOD_LABELS.get(r["method"], r["method"])
+                    lines.append(
+                        f"• #{r['id']} · {r['amount_rub']:.2f} ₽ · {method_label}\n"
+                        f"  {label} · {r['created_at']}"
+                    )
+                text = "\n".join(lines)
+            await call.message.edit_text(text, parse_mode=ParseMode.HTML,
+                                         reply_markup=keyboards.create_back_button_menu(f"finance_{shop_id}"))
+
+        # ── Владелец платформы: отметить выплачено / отклонить ──
+        elif data.startswith("withdraw_paid_"):
+            wid = int(data.split("_")[-1])
+            if not config.is_owner(user_id):
+                await call.answer("Только владелец платформы", show_alert=True)
+                return
+            ok = await database.mark_withdrawal_paid_out(wid)
+            if not ok:
+                await call.answer("Не удалось отметить (вывод уже обработан?)", show_alert=True)
+                return
+            w = await database.get_withdrawal(wid)
+            await call.answer("Отмечено как выплачено")
+            try:
+                await call.message.edit_text(
+                    (call.message.html_text or call.message.text or "")
+                    + "\n\n✅ Отмечено как выплачено.",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+            # Уведомим продавца
+            if w:
+                try:
+                    await bot.send_message(
+                        w["seller_user_id"],
+                        f"✅ Вывод #{w['id']} на сумму {w['amount_rub']:.2f} ₽ выплачен."
+                    )
+                except Exception:
+                    pass
+
+        elif data.startswith("withdraw_reject_"):
+            wid = int(data.split("_")[-1])
+            if not config.is_owner(user_id):
+                await call.answer("Только владелец платформы", show_alert=True)
+                return
+            user_states[user_id] = UserState.WITHDRAW_REJECT_NOTE
+            user_states[_uid(user_id, "withdrawal_id")] = wid
+            await call.message.answer(
+                "Введите причину отказа (она будет показана продавцу). "
+                "Сумма вывода вернётся ему на баланс."
             )
 
         # ── Приветствие ──
@@ -1233,6 +1373,139 @@ async def save_paymaster_token(message: Message):
     else:
         await message.answer("❌ Ошибка при сохранении токена")
     user_states[user_id] = UserState.SHOP_MENU
+
+
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_AMOUNT))
+async def handle_withdraw_amount(message: Message):
+    user_id = message.from_user.id
+    shop_id = user_states.get(_uid(user_id, "shop_id"))
+    method  = user_states.get(_uid(user_id, "withdraw_method"))
+    raw     = (message.text or "").strip().replace(",", ".")
+    if raw.lower() == "назад":
+        user_states[user_id] = UserState.SHOP_MENU
+        await message.answer("❌ Запрос вывода отменён",
+                             reply_markup=keyboards.create_finance_menu(shop_id) if shop_id else keyboards.create_main_menu())
+        return
+    try:
+        amount = float(raw)
+    except ValueError:
+        await message.answer("❌ Введите число — сумму в рублях.")
+        return
+    if amount < config.MIN_WITHDRAWAL:
+        await message.answer(f"❌ Минимальная сумма вывода — {config.MIN_WITHDRAWAL} ₽.")
+        return
+    bal = await database.get_seller_balance(shop_id) if shop_id else None
+    if not bal or amount > bal["amount_rub"] + 0.001:
+        avail = bal["amount_rub"] if bal else 0.0
+        await message.answer(f"❌ На балансе только {avail:.2f} ₽. Введите меньшую сумму.")
+        return
+    user_states[_uid(user_id, "withdraw_amount")] = amount
+    user_states[user_id] = UserState.WITHDRAW_REQUISITES
+    placeholders = {
+        "card":     "номер карты, 16 цифр",
+        "sbp":      "номер телефона и название банка (например, +79991234567 Тинькофф)",
+        "business": "ИНН, расчётный счёт, БИК",
+        "crypto":   "сеть и адрес (например, USDT TRC20: TXxx...)",
+    }
+    method_label = database.WITHDRAWAL_METHOD_LABELS.get(method, method)
+    await message.answer(
+        f"Сумма: <b>{amount:.2f} ₽</b>\nСпособ: {method_label}\n\n"
+        f"Отправьте реквизиты одним сообщением.\nФормат: {placeholders.get(method, '')}\n\n"
+        f"Отправьте 'назад' для отмены.",
+        parse_mode=ParseMode.HTML
+    )
+
+
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_REQUISITES))
+async def handle_withdraw_requisites(message: Message):
+    user_id = message.from_user.id
+    shop_id = user_states.get(_uid(user_id, "shop_id"))
+    method  = user_states.get(_uid(user_id, "withdraw_method"))
+    amount  = user_states.get(_uid(user_id, "withdraw_amount"))
+    raw     = (message.text or "").strip()
+    if raw.lower() == "назад":
+        user_states[user_id] = UserState.SHOP_MENU
+        await message.answer("❌ Запрос вывода отменён",
+                             reply_markup=keyboards.create_finance_menu(shop_id) if shop_id else keyboards.create_main_menu())
+        return
+    if not shop_id or not method or not amount:
+        user_states[user_id] = UserState.SHOP_MENU
+        await message.answer("❌ Сессия запроса потеряна. Начните заново.",
+                             reply_markup=keyboards.create_main_menu())
+        return
+    if len(raw) < 4:
+        await message.answer("❌ Реквизиты слишком короткие. Введите ещё раз.")
+        return
+    wid = await database.create_withdrawal(shop_id, user_id, amount, method, raw)
+    user_states.pop(_uid(user_id, "withdraw_amount"), None)
+    user_states.pop(_uid(user_id, "withdraw_method"), None)
+    user_states[user_id] = UserState.SHOP_MENU
+    if not wid:
+        await message.answer(
+            "❌ Не удалось создать запрос (недостаточно средств?). Проверьте баланс.",
+            reply_markup=keyboards.create_finance_menu(shop_id)
+        )
+        return
+    shop_info = await database.get_shop_info(shop_id)
+    shop_name = shop_info[2] if shop_info else f"shop#{shop_id}"
+    await message.answer(
+        f"✅ Запрос вывода #{wid} создан и автоматически одобрен.\n\n"
+        f"Сумма: {amount:.2f} ₽\n"
+        f"Способ: {database.WITHDRAWAL_METHOD_LABELS.get(method, method)}\n\n"
+        f"Владелец платформы получит уведомление и переведёт деньги по реквизитам.",
+        reply_markup=keyboards.create_finance_menu(shop_id)
+    )
+    # Уведомляем всех владельцев платформы
+    method_label = database.WITHDRAWAL_METHOD_LABELS.get(method, method)
+    masked_req = config.mask_secret(raw, visible=4)
+    notify_text = (
+        f"💸 <b>Новый запрос на вывод #{wid}</b>\n\n"
+        f"Магазин: {shop_name} (id={shop_id})\n"
+        f"Продавец: <code>{user_id}</code>\n"
+        f"Сумма: <b>{amount:.2f} ₽</b>\n"
+        f"Способ: {method_label}\n"
+        f"Реквизиты (маска): <code>{masked_req}</code>\n\n"
+        f"Полные реквизиты:\n<code>{raw}</code>"
+    )
+    for owner_id in config.OWNER_IDS:
+        try:
+            await bot.send_message(
+                owner_id, notify_text, parse_mode=ParseMode.HTML,
+                reply_markup=keyboards.create_withdraw_owner_menu(wid)
+            )
+        except Exception as e:
+            logger.error(f"Не удалось уведомить OWNER {owner_id} о выводе #{wid}: {e}")
+
+
+@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_REJECT_NOTE))
+async def handle_withdraw_reject_note(message: Message):
+    user_id = message.from_user.id
+    if not config.is_owner(user_id):
+        user_states[user_id] = UserState.MAIN_MENU
+        return
+    wid = user_states.get(_uid(user_id, "withdrawal_id"))
+    note = (message.text or "").strip()[:500]
+    user_states[user_id] = UserState.MAIN_MENU
+    user_states.pop(_uid(user_id, "withdrawal_id"), None)
+    if not wid:
+        await message.answer("❌ Сессия отклонения потеряна.")
+        return
+    ok = await database.reject_withdrawal(wid, owner_note=note or None)
+    if not ok:
+        await message.answer("❌ Не удалось отклонить (вывод уже обработан?).")
+        return
+    w = await database.get_withdrawal(wid)
+    await message.answer(f"❌ Вывод #{wid} отклонён, средства возвращены продавцу на баланс.")
+    if w:
+        try:
+            await bot.send_message(
+                w["seller_user_id"],
+                f"❌ Ваш запрос на вывод #{w['id']} отклонён.\n"
+                f"Сумма {w['amount_rub']:.2f} ₽ возвращена на баланс.\n"
+                + (f"Причина: {note}" if note else "")
+            )
+        except Exception:
+            pass
 
 
 @dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_PAYMENT))

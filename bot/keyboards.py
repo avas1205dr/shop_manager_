@@ -66,7 +66,7 @@ def create_shop_management_menu(shop_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="🔑 API бота", callback_data=f"edit_token_{shop_id}"),
-        InlineKeyboardButton(text="💳 PayMaster Токен", callback_data=f"paymaster_token_{shop_id}"),
+        InlineKeyboardButton(text="💰 Финансы", callback_data=f"finance_{shop_id}"),
     )
     builder.row(
         InlineKeyboardButton(text="📦 Товары", callback_data=f"manage_products_{shop_id}"),
@@ -86,6 +86,46 @@ def create_shop_management_menu(shop_id: int) -> InlineKeyboardMarkup:
     )
     builder.row(InlineKeyboardButton(text="🗑️ Удалить магазин", callback_data=f"delete_shop_{shop_id}"))
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="my_shops"))
+    return builder.as_markup()
+
+
+# ─────────────────── ФИНАНСЫ МАГАЗИНА ───────────────────
+
+def create_finance_menu(shop_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="💸 Запросить вывод",
+                                     callback_data=f"withdraw_start_{shop_id}"))
+    builder.row(InlineKeyboardButton(text="📜 История выводов",
+                                     callback_data=f"withdraw_history_{shop_id}"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"manage_shop_{shop_id}"))
+    return builder.as_markup()
+
+
+def create_withdraw_method_menu(shop_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    methods = [
+        ("card",     "💳 Карта"),
+        ("sbp",      "📱 СБП"),
+        ("business", "🧾 ИП/самозанятый"),
+        ("crypto",   "🪙 Крипта"),
+    ]
+    for code, label in methods:
+        builder.row(InlineKeyboardButton(
+            text=label, callback_data=f"withdraw_method_{shop_id}_{code}"
+        ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"finance_{shop_id}"))
+    return builder.as_markup()
+
+
+def create_withdraw_owner_menu(withdrawal_id: int) -> InlineKeyboardMarkup:
+    """Кнопки в уведомлении владельцу о новом запросе на вывод."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Отметить выплачено",
+                             callback_data=f"withdraw_paid_{withdrawal_id}"),
+        InlineKeyboardButton(text="❌ Отклонить",
+                             callback_data=f"withdraw_reject_{withdrawal_id}"),
+    )
     return builder.as_markup()
 
 

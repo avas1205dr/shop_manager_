@@ -13,7 +13,7 @@ import logging
 import sqlite3
 import uuid
 from functools import wraps
-from typing import Optional
+from typing import List, Optional
 
 import aiosqlite
 from yookassa import Configuration, Payment
@@ -219,6 +219,36 @@ def init_database():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (dispute_id) REFERENCES disputes(id) ON DELETE CASCADE
     );
+
+    -- Внутренний баланс продавца (одна строка на магазин). Все суммы в копейках.
+    CREATE TABLE IF NOT EXISTS seller_balances (
+        shop_id INTEGER PRIMARY KEY,
+        amount_kopecks INTEGER NOT NULL DEFAULT 0,
+        total_earned_kopecks INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+    );
+
+    -- Запросы на вывод средств от продавцов.
+    CREATE TABLE IF NOT EXISTS withdrawals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shop_id INTEGER NOT NULL,
+        seller_user_id INTEGER NOT NULL,
+        amount_kopecks INTEGER NOT NULL,
+        method TEXT NOT NULL,             -- 'card' | 'sbp' | 'business' | 'crypto'
+        requisites TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'approved',  -- 'approved' | 'paid_out' | 'rejected'
+        owner_note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        processed_at TIMESTAMP,
+        FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+    );
+
+    -- Служебная таблица для одноразовых миграций.
+    CREATE TABLE IF NOT EXISTS db_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
     """)
     conn.commit()
 
@@ -249,6 +279,26 @@ def init_database():
     _add_column("orders", "delivery_payload", "TEXT")  # сохранённый цифровой контент, отправленный покупателю
     _add_column("orders", "seller_note", "TEXT")
     _add_column("orders", "order_group_id", "TEXT")
+
+    # Одноразовая миграция: насыпаем seller_balances из истории paid-заказов,
+    # чтобы существующие магазины не начинали с 0 после деплоя финансовой части.
+    c.execute("SELECT value FROM db_meta WHERE key='balances_backfilled'")
+    row = c.fetchone()
+    if not row:
+        c.execute(f"""
+            INSERT OR REPLACE INTO seller_balances (shop_id, amount_kopecks, total_earned_kopecks, updated_at)
+            SELECT shop_id,
+                   CAST(ROUND(SUM(total_price) * 100) AS INTEGER),
+                   CAST(ROUND(SUM(total_price) * 100) AS INTEGER),
+                   CURRENT_TIMESTAMP
+            FROM orders
+            WHERE status IN ('{ORDER_STATUS_PAID}','{ORDER_STATUS_PROCESSING}','{ORDER_STATUS_SHIPPED}',
+                             '{ORDER_STATUS_DELIVERED}','{ORDER_STATUS_COMPLETED}')
+              AND (payment_method IS NULL OR LOWER(payment_method) <> 'cash_on_delivery')
+            GROUP BY shop_id
+        """)
+        c.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES ('balances_backfilled', '1')")
+        conn.commit()
 
     conn.close()
 
@@ -817,6 +867,7 @@ async def buy_product(shop_id: int, user_id: int, product_id: int,
     if not isinstance(total_price, (int, float)) or total_price < 0:
         return None
     paid_at_sql = "CURRENT_TIMESTAMP" if status == ORDER_STATUS_PAID else "NULL"
+    order_id: Optional[int] = None
     async with _db() as db:
         try:
             async with db.execute(
@@ -826,12 +877,18 @@ async def buy_product(shop_id: int, user_id: int, product_id: int,
                 (shop_id, user_id, product_id, quantity, total_price, delivery_address,
                  status, payment_method, group_id)
             ) as cur:
-                return cur.lastrowid
+                order_id = cur.lastrowid
         except Exception as e:
             logging.error(f"Ошибка добавления заказа: {e}")
             return None
         finally:
             await db.commit()
+    # Если заказ сразу создан как оплаченный — зачисляем продавцу.
+    # Cash-on-delivery идёт мимо платформы и баланса не касается.
+    is_cash = (payment_method or "").lower() == "cash_on_delivery"
+    if order_id and status == ORDER_STATUS_PAID and total_price > 0 and not is_cash:
+        await credit_seller_balance(shop_id, total_price, source="order_created_paid")
+    return order_id
 
 
 async def place_cart_order(shop_id: int, customer_id: int, items, total_price: float,
@@ -872,6 +929,11 @@ async def place_cart_order(shop_id: int, customer_id: int, items, total_price: f
             ) as cur:
                 order_ids.append(cur.lastrowid)
         await db.commit()
+    # Зачисляем общий итог корзины продавцу (одна строка баланса на группу),
+    # только если оплата прошла онлайн через платформу.
+    is_cash = (payment_method or "").lower() == "cash_on_delivery"
+    if status == ORDER_STATUS_PAID and total_price and total_price > 0 and not is_cash:
+        await credit_seller_balance(shop_id, total_price, source="cart_paid")
     return group_id, order_ids
 
 
@@ -1381,6 +1443,12 @@ async def update_order_status(order_id: int, new_status: str,
                               note: Optional[str] = None) -> bool:
     if new_status not in ORDER_STATUS_LABELS:
         return False
+    # Запоминаем старый статус, чтобы корректно начислять/списывать баланс
+    # только на ПЕРЕХОДАХ (а не при перезаписи того же статуса).
+    old = await get_order(order_id)
+    if not old:
+        return False
+    old_status = old.get("status")
     fields = ["status=?", "updated_at=CURRENT_TIMESTAMP"]
     params = [new_status]
     if new_status == ORDER_STATUS_PAID:
@@ -1398,6 +1466,25 @@ async def update_order_status(order_id: int, new_status: str,
             f"UPDATE orders SET {', '.join(fields)} WHERE id=?", params
         )
         await db.commit()
+    # Финансовые эффекты по переходу статуса:
+    total = float(old.get("total_price") or 0.0)
+    shop_id = old.get("shop_id")
+    pmethod = (old.get("payment_method") or "").lower()
+    # Cash-on-delivery — деньги не идут через платформу, поэтому баланс
+    # продавца на платформе не меняем (он получит наличные напрямую).
+    is_cash = pmethod == "cash_on_delivery"
+    if total > 0 and shop_id and not is_cash:
+        # Перевод в PAID впервые → +на баланс продавца.
+        if new_status == ORDER_STATUS_PAID and old_status != ORDER_STATUS_PAID:
+            await credit_seller_balance(shop_id, total, source=f"order_paid:{order_id}")
+        # Возврат после оплаты → списываем с продавца обратно. Если оплачено
+        # никогда не было (статус сразу cancel из new) — ничего не делаем.
+        if new_status == ORDER_STATUS_REFUNDED and old_status in (
+            ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING, ORDER_STATUS_SHIPPED,
+            ORDER_STATUS_DELIVERED, ORDER_STATUS_COMPLETED, ORDER_STATUS_DISPUTED,
+            ORDER_STATUS_REFUND_REQUESTED,
+        ):
+            await debit_seller_balance(shop_id, _rub_to_kop(total))
     return True
 
 
@@ -1571,3 +1658,231 @@ async def is_user_in_dispute(order_id: int, user_id: int) -> Optional[int]:
     if not row:
         return None
     return row[0]
+
+
+# ─────────────────── ФИНАНСЫ: БАЛАНС И ВЫВОДЫ ───────────────────
+
+# Способы вывода
+WITHDRAWAL_METHOD_CARD     = "card"
+WITHDRAWAL_METHOD_SBP      = "sbp"
+WITHDRAWAL_METHOD_BUSINESS = "business"
+WITHDRAWAL_METHOD_CRYPTO   = "crypto"
+
+WITHDRAWAL_METHODS = (
+    WITHDRAWAL_METHOD_CARD,
+    WITHDRAWAL_METHOD_SBP,
+    WITHDRAWAL_METHOD_BUSINESS,
+    WITHDRAWAL_METHOD_CRYPTO,
+)
+
+WITHDRAWAL_METHOD_LABELS = {
+    WITHDRAWAL_METHOD_CARD:     "💳 Банковская карта",
+    WITHDRAWAL_METHOD_SBP:      "📱 СБП (телефон)",
+    WITHDRAWAL_METHOD_BUSINESS: "🧾 Реквизиты ИП/самозанятого",
+    WITHDRAWAL_METHOD_CRYPTO:   "🪙 Криптокошелёк",
+}
+
+# Статусы вывода
+WITHDRAWAL_STATUS_APPROVED = "approved"
+WITHDRAWAL_STATUS_PAID_OUT = "paid_out"
+WITHDRAWAL_STATUS_REJECTED = "rejected"
+
+WITHDRAWAL_STATUS_LABELS = {
+    WITHDRAWAL_STATUS_APPROVED: "⏳ Одобрен, ждёт выплаты",
+    WITHDRAWAL_STATUS_PAID_OUT: "✅ Выплачено",
+    WITHDRAWAL_STATUS_REJECTED: "❌ Отклонено",
+}
+
+
+def _rub_to_kop(rub: float) -> int:
+    """Превращает рубли в копейки безопасно (округлением)."""
+    try:
+        return int(round(float(rub) * 100))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _kop_to_rub(kop: int) -> float:
+    try:
+        return round(int(kop) / 100, 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def get_seller_balance(shop_id: int) -> dict:
+    """Возвращает {amount_kopecks, total_earned_kopecks, amount_rub, total_earned_rub}."""
+    async with _db() as db:
+        async with db.execute(
+            "SELECT amount_kopecks, total_earned_kopecks FROM seller_balances WHERE shop_id=?",
+            (shop_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return {"amount_kopecks": 0, "total_earned_kopecks": 0,
+                "amount_rub": 0.0, "total_earned_rub": 0.0}
+    amt, tot = int(row[0] or 0), int(row[1] or 0)
+    return {
+        "amount_kopecks": amt,
+        "total_earned_kopecks": tot,
+        "amount_rub": _kop_to_rub(amt),
+        "total_earned_rub": _kop_to_rub(tot),
+    }
+
+
+async def credit_seller_balance(shop_id: int, amount_rub: float, *,
+                                source: str = "order") -> bool:
+    """Зачисляет рубли на баланс продавца (через копейки)."""
+    if not isinstance(shop_id, int) or shop_id <= 0:
+        return False
+    kop = _rub_to_kop(amount_rub)
+    if kop <= 0:
+        return False
+    async with _db() as db:
+        # UPSERT: создаём строку если ещё нет.
+        await db.execute(
+            "INSERT INTO seller_balances (shop_id, amount_kopecks, total_earned_kopecks, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(shop_id) DO UPDATE SET "
+            "  amount_kopecks=amount_kopecks+excluded.amount_kopecks, "
+            "  total_earned_kopecks=total_earned_kopecks+excluded.total_earned_kopecks, "
+            "  updated_at=CURRENT_TIMESTAMP",
+            (shop_id, kop, kop)
+        )
+        await db.commit()
+    return True
+
+
+async def debit_seller_balance(shop_id: int, amount_kopecks: int) -> bool:
+    """Атомарно снимает копейки с баланса продавца. Возвращает False если средств не хватает."""
+    if not isinstance(shop_id, int) or shop_id <= 0:
+        return False
+    if amount_kopecks <= 0:
+        return False
+    async with _db() as db:
+        async with db.execute(
+            "UPDATE seller_balances SET amount_kopecks=amount_kopecks-?, updated_at=CURRENT_TIMESTAMP "
+            "WHERE shop_id=? AND amount_kopecks>=?",
+            (amount_kopecks, shop_id, amount_kopecks)
+        ) as cur:
+            ok = cur.rowcount > 0
+        await db.commit()
+    return ok
+
+
+async def create_withdrawal(shop_id: int, seller_user_id: int,
+                            amount_rub: float, method: str,
+                            requisites: str) -> Optional[int]:
+    """Создаёт запрос на вывод и атомарно списывает деньги с баланса.
+
+    Возвращает id записи или None, если средств не хватает / валидация не прошла.
+    Статус выставляется сразу 'approved' (по решению пользователя — авто-одобрение).
+    """
+    if method not in WITHDRAWAL_METHODS:
+        return None
+    requisites = (requisites or "").strip()
+    if len(requisites) < 4:
+        return None
+    kop = _rub_to_kop(amount_rub)
+    if kop <= 0:
+        return None
+    # Сначала пытаемся списать; если не хватило — отбой.
+    if not await debit_seller_balance(shop_id, kop):
+        return None
+    async with _db() as db:
+        async with db.execute(
+            "INSERT INTO withdrawals (shop_id, seller_user_id, amount_kopecks, method, requisites, status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (shop_id, seller_user_id, kop, method, requisites, WITHDRAWAL_STATUS_APPROVED)
+        ) as cur:
+            wid = cur.lastrowid
+        await db.commit()
+    return wid
+
+
+async def get_withdrawal(wid: int) -> Optional[dict]:
+    async with _db() as db:
+        async with db.execute(
+            "SELECT id, shop_id, seller_user_id, amount_kopecks, method, requisites, "
+            "       status, owner_note, created_at, processed_at "
+            "FROM withdrawals WHERE id=?", (wid,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0], "shop_id": row[1], "seller_user_id": row[2],
+        "amount_kopecks": row[3], "amount_rub": _kop_to_rub(row[3]),
+        "method": row[4], "requisites": row[5],
+        "status": row[6], "owner_note": row[7],
+        "created_at": row[8], "processed_at": row[9],
+    }
+
+
+async def list_shop_withdrawals(shop_id: int, limit: int = 20) -> List[dict]:
+    async with _db() as db:
+        async with db.execute(
+            "SELECT id, amount_kopecks, method, requisites, status, created_at, processed_at "
+            "FROM withdrawals WHERE shop_id=? ORDER BY id DESC LIMIT ?",
+            (shop_id, limit)
+        ) as cur:
+            rows = await cur.fetchall()
+    return [{
+        "id": r[0], "amount_kopecks": r[1], "amount_rub": _kop_to_rub(r[1]),
+        "method": r[2], "requisites": r[3], "status": r[4],
+        "created_at": r[5], "processed_at": r[6],
+    } for r in rows]
+
+
+async def list_pending_withdrawals(limit: int = 50) -> List[dict]:
+    """Список выводов, ожидающих фактической выплаты владельцем."""
+    async with _db() as db:
+        async with db.execute(
+            "SELECT w.id, w.shop_id, s.shop_name, w.seller_user_id, w.amount_kopecks, "
+            "       w.method, w.requisites, w.created_at "
+            "FROM withdrawals w LEFT JOIN shops s ON w.shop_id=s.id "
+            "WHERE w.status=? ORDER BY w.id ASC LIMIT ?",
+            (WITHDRAWAL_STATUS_APPROVED, limit)
+        ) as cur:
+            rows = await cur.fetchall()
+    return [{
+        "id": r[0], "shop_id": r[1], "shop_name": r[2],
+        "seller_user_id": r[3], "amount_kopecks": r[4], "amount_rub": _kop_to_rub(r[4]),
+        "method": r[5], "requisites": r[6], "created_at": r[7],
+    } for r in rows]
+
+
+async def mark_withdrawal_paid_out(wid: int, owner_note: Optional[str] = None) -> bool:
+    """Отмечает вывод как фактически выплаченный."""
+    async with _db() as db:
+        async with db.execute(
+            "UPDATE withdrawals SET status=?, owner_note=?, processed_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND status=?",
+            (WITHDRAWAL_STATUS_PAID_OUT, owner_note, wid, WITHDRAWAL_STATUS_APPROVED)
+        ) as cur:
+            ok = cur.rowcount > 0
+        await db.commit()
+    return ok
+
+
+async def reject_withdrawal(wid: int, owner_note: Optional[str] = None) -> bool:
+    """Отклоняет вывод и возвращает деньги на баланс продавца. Идемпотентно."""
+    w = await get_withdrawal(wid)
+    if not w or w["status"] != WITHDRAWAL_STATUS_APPROVED:
+        return False
+    async with _db() as db:
+        # Возвращаем средства
+        await db.execute(
+            "INSERT INTO seller_balances (shop_id, amount_kopecks, total_earned_kopecks, updated_at) "
+            "VALUES (?, ?, 0, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(shop_id) DO UPDATE SET "
+            "  amount_kopecks=amount_kopecks+excluded.amount_kopecks, "
+            "  updated_at=CURRENT_TIMESTAMP",
+            (w["shop_id"], w["amount_kopecks"])
+        )
+        await db.execute(
+            "UPDATE withdrawals SET status=?, owner_note=?, processed_at=CURRENT_TIMESTAMP "
+            "WHERE id=?",
+            (WITHDRAWAL_STATUS_REJECTED, owner_note, wid)
+        )
+        await db.commit()
+    return True

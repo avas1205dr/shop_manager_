@@ -94,8 +94,31 @@ if COMPLAINT_THRESHOLD < 1:
 # ── База данных ──────────────────────────────────────────────────────────
 DB_PATH: str = os.getenv("DB_PATH", "db/shop_manager.db").strip() or "db/shop_manager.db"
 
+# ── Финансы ──────────────────────────────────────────────────────────────
+# Минимальная сумма вывода в рублях. Запросы на меньшую сумму бот не пропускает.
+try:
+    MIN_WITHDRAWAL: int = int(os.getenv("MIN_WITHDRAWAL", "1000"))
+except ValueError:
+    MIN_WITHDRAWAL = 1000
+if MIN_WITHDRAWAL < 0:
+    MIN_WITHDRAWAL = 0
+
 # ── Логирование ──────────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+
+
+def mask_secret(value: Optional[str], visible: int = 4) -> str:
+    """Возвращает безопасную для показа маску секрета: `1234…dPjK`.
+
+    Используется для отображения токенов, которые нельзя показывать пользователю
+    целиком (бот-токены магазинов, реквизиты и т.п.).
+    """
+    if not value:
+        return "—"
+    s = str(value).strip()
+    if len(s) <= visible * 2:
+        return "…" + s[-visible:] if s else "—"
+    return f"{s[:visible]}…{s[-visible:]}"
 
 
 def is_owner(user_id: int) -> bool:

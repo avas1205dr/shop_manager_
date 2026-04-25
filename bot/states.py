@@ -38,6 +38,13 @@ class UserState:
     # Модерация (главный бот)
     MOD_REJECT_REASON = "mod_reject_reason"
 
+    # Финансы / вывод средств
+    WITHDRAW_AMOUNT     = "withdraw_amount"
+    WITHDRAW_REQUISITES = "withdraw_requisites"
+
+    # Владелец отклоняет вывод (вводит причину)
+    WITHDRAW_REJECT_NOTE = "withdraw_reject_note"
+
 
 class ShopBotState:
     MAIN_MENU = "main_menu"
