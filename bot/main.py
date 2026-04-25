@@ -2445,75 +2445,60 @@ async def manager_successful_payment(message: Message):
     shop_id = order["shop_id"]
     shop_name = order.get("shop_name") or f"shop#{shop_id}"
     total = float(order["total_price"] or 0)
-    # 1. Покупателю: подтверждение и (если есть) цифровой контент.
-    await message.answer(
-        f"✅ Заказ #{order_id} оплачен!\n"
-        f"Магазин: {shop_name}\n"
-        f"Сумма: {total:.2f} ₽\n\n"
-        f"Возвращайтесь в магазин-бот — там увидите статус «оплачен» в «Мои заказы»."
-    )
+    # 1. Покупателю: подтверждение в МЕНЕДЖЕР-боте (там, где он платил).
+    try:
+        await message.answer(
+            f"✅ Заказ #{order_id} оплачен!\n"
+            f"Магазин: {shop_name}\n"
+            f"Сумма: {total:.2f} ₽\n\n"
+            f"Возвращайтесь в магазин-бот — там увидите статус «оплачен» в «Мои заказы»."
+        )
+    except Exception as e:
+        logger.error(f"manager notify buyer failed for order {order_id}: {e}")
+    # 2. Покупателю: дублирующее уведомление в МАГАЗИН-боте, чтобы он
+    #    увидел подтверждение в той же ленте, где совершал покупку.
+    shop_sender = active_shop_bots.get(shop_id)
+    if shop_sender:
+        try:
+            await shop_sender.send_message(
+                order["customer_user_id"],
+                f"💳 Ваш заказ #{order_id} оплачен!\n"
+                f"Сумма: {total:.2f} ₽\n"
+                f"Подробности — в разделе «Мои заказы»."
+            )
+        except Exception as e:
+            logger.error(f"shop-bot notify buyer failed for order {order_id}: {e}")
+    # 3. Цифровая доставка идёт через магазин-бот (если поднят), потому что
+    #    file_id Telegram между ботами не работает; для путей на диске мы
+    #    используем FSInputFile и можем отправить откуда угодно.
+    #    _deliver_digital_content также переводит заказ в DELIVERED — это
+    #    корректно для цифры (товар у покупателя сразу).
     if order.get("digital_content"):
         try:
-            await _deliver_digital_content_from_manager(message.from_user.id, order)
+            await _deliver_digital_content(order)
         except Exception as e:
             logger.error(f"digital delivery failed for order {order_id}: {e}")
-    # 2. Продавцу/админам магазина — уведомление.
-    admin_ids = []
+    # 4. Продавцу/админам магазина — уведомление в менеджер-боте + в shop-bot.
+    admin_ids: list[int] = []
     shop_info = await database.get_shop_info(shop_id)
     if shop_info:
         admin_ids = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
+    notify_text = (
+        f"💳 Поступила оплата по заказу #{order_id}\n"
+        f"Магазин: {shop_name}\n"
+        f"Товар: {order.get('product_name')} ×{order['quantity']}\n"
+        f"Сумма: <b>{total:.2f} ₽</b> → начислено на ваш баланс платформы."
+    )
     for aid in set(admin_ids):
         try:
-            await bot.send_message(
-                aid,
-                f"💳 Поступила оплата по заказу #{order_id}\n"
-                f"Магазин: {shop_name}\n"
-                f"Товар: {order.get('product_name')} ×{order['quantity']}\n"
-                f"Сумма: <b>{total:.2f} ₽</b> → начислено на ваш баланс платформы.",
-                parse_mode=ParseMode.HTML
-            )
+            await bot.send_message(aid, notify_text, parse_mode=ParseMode.HTML)
         except Exception as e:
-            logger.error(f"Не удалось уведомить админа {aid} об оплате #{order_id}: {e}")
-
-
-async def _deliver_digital_content_from_manager(user_id: int, order: dict) -> None:
-    """Отправляет покупателю цифровой контент заказа из менеджер-бота.
-
-    В отличие от `_deliver_digital_content` (которое идёт через магазин-бот
-    и помечает заказ DELIVERED), эта функция используется на этапе оплаты
-    в менеджер-боте — мы отдаём контент покупателю там же, где он платит.
-    Статус DELIVERED тут не выставляем, чтобы не ломать обычный жизненный
-    цикл заказа (физических товаров и cash-on-delivery).
-    """
-    kind = order.get("digital_content_kind")
-    content = order.get("digital_content")
-    ttl = order.get("digital_ttl_hours")
-    if not content:
-        return
-    ttl_note = f"\n\n⏳ Действует {ttl} ч от момента оплаты." if ttl else ""
-    header = f"📦 Ваш цифровой товар по заказу #{order['id']}:{ttl_note}\n\n"
-    if kind == "text":
-        await bot.send_message(user_id, header + content)
-    elif kind == "url":
-        await bot.send_message(user_id, header + content, disable_web_page_preview=False)
-    elif kind in ("photo_id", "photo_path"):
-        try:
-            if kind == "photo_path" and os.path.exists(content):
-                await bot.send_photo(user_id, FSInputFile(content), caption=header)
-            else:
-                await bot.send_photo(user_id, content, caption=header)
-        except Exception:
-            await bot.send_message(user_id, header + "(не удалось отправить файл — обратитесь к продавцу)")
-    elif kind in ("file_id", "file_path"):
-        try:
-            if kind == "file_path" and os.path.exists(content):
-                await bot.send_document(user_id, FSInputFile(content), caption=header)
-            else:
-                await bot.send_document(user_id, content, caption=header)
-        except Exception:
-            await bot.send_message(user_id, header + "(не удалось отправить файл — обратитесь к продавцу)")
-    else:
-        await bot.send_message(user_id, header + str(content))
+            logger.error(f"manager notify admin {aid} failed for order #{order_id}: {e}")
+        if shop_sender:
+            try:
+                await shop_sender.send_message(aid, notify_text, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"shop-bot notify admin {aid} failed for order #{order_id}: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────

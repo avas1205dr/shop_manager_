@@ -1348,10 +1348,17 @@ async def update_product_digital(product_id: int, kind: Optional[str],
         "text", "url", "photo_path", "file_path", "photo_id", "file_id"
     ):
         return False
+    # Считаем товар цифровым тогда, когда у него есть и kind, и content.
+    # Без is_digital=1 ручная доставка (`_deliver_digital_content`) и
+    # автодоставка после оплаты считают товар физическим и отказываются
+    # отправлять контент ("тип товара не указан"), а в карточке заказа
+    # отсутствует пометка 💾.
+    new_is_digital = 1 if (kind and content) else 0
     async with _db() as db:
         await db.execute(
-            "UPDATE products SET digital_content=?, digital_content_kind=?, digital_ttl_hours=? WHERE id=?",
-            (content, kind, ttl_hours, product_id)
+            "UPDATE products SET digital_content=?, digital_content_kind=?, "
+            "digital_ttl_hours=?, is_digital=? WHERE id=?",
+            (content, kind, ttl_hours, new_is_digital, product_id)
         )
         await db.commit()
     return True
