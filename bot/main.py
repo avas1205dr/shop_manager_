@@ -2414,7 +2414,7 @@ async def manager_successful_payment(message: Message):
     )
     if order.get("digital_content"):
         try:
-            await _deliver_digital_content(message.from_user.id, order)
+            await _deliver_digital_content_from_manager(message.from_user.id, order)
         except Exception as e:
             logger.error(f"digital delivery failed for order {order_id}: {e}")
     # 2. Продавцу/админам магазина — уведомление.
@@ -2436,8 +2436,15 @@ async def manager_successful_payment(message: Message):
             logger.error(f"Не удалось уведомить админа {aid} об оплате #{order_id}: {e}")
 
 
-async def _deliver_digital_content(user_id: int, order: dict) -> None:
-    """Отправляет покупателю цифровой контент заказа из менеджер-бота."""
+async def _deliver_digital_content_from_manager(user_id: int, order: dict) -> None:
+    """Отправляет покупателю цифровой контент заказа из менеджер-бота.
+
+    В отличие от `_deliver_digital_content` (которое идёт через магазин-бот
+    и помечает заказ DELIVERED), эта функция используется на этапе оплаты
+    в менеджер-боте — мы отдаём контент покупателю там же, где он платит.
+    Статус DELIVERED тут не выставляем, чтобы не ломать обычный жизненный
+    цикл заказа (физических товаров и cash-on-delivery).
+    """
     kind = order.get("digital_content_kind")
     content = order.get("digital_content")
     ttl = order.get("digital_ttl_hours")
