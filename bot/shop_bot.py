@@ -197,7 +197,8 @@ async def _deliver_digital(order: dict, bot: Bot) -> bool:
 
 async def _send_invoice_for_direct_buy(
         chat_id: int, user_id: int, product_id: int, quantity: int,
-        shop_id: int, bot: Bot, states: dict
+        shop_id: int, bot: Bot, states: dict,
+        manager_bot: Optional[Bot] = None,
 ):
     if await database.is_shop_purchases_blocked(shop_id):
         await bot.send_message(
@@ -212,6 +213,12 @@ async def _send_invoice_for_direct_buy(
     if not product:
         await bot.send_message(chat_id, "❌ Товар не найден")
         return
+
+    shop_info = await database.get_shop_info(shop_id)
+    if not shop_info:
+        await bot.send_message(chat_id, "❌ Магазин не найден")
+        return
+    shop_payment_method = shop_info[4]
 
     title       = product[2]
     description = product[3] or "Покупка товара"
@@ -261,6 +268,72 @@ async def _send_invoice_for_direct_buy(
             return
         await database.use_promocode(promo['id'])
 
+    # Цифровой ли товар? — для физических нужен адрес, тут direct_buy
+    # вызывается уже после ввода адреса (или сразу для цифровых).
+    is_digital = bool(product[6]) if len(product) > 6 else True
+    delivery_addr = states.pop(f"{user_id}_address_direct", None)
+    if not delivery_addr:
+        delivery_addr = "Цифровой товар" if is_digital else "Уточняется"
+
+    # Если магазин настроен на оплату при получении — оформляем заказ как
+    # cash_on_delivery, не требуя PAYMENTS_TOKEN и не отправляя в менеджер-
+    # бот за invoice. Зеркало логики корзины (_handle_delivery_address_logic).
+    if shop_payment_method == 'cash_on_delivery':
+        order_id = await database.buy_product(
+            shop_id, user_id, product_id, quantity, total, delivery_addr,
+            status=database.ORDER_STATUS_PROCESSING,
+            payment_method='cash_on_delivery'
+        )
+        if not order_id:
+            await bot.send_message(
+                chat_id,
+                "❌ Не удалось оформить заказ. Попробуйте позже.",
+                reply_markup=_create_shop_main_menu()
+            )
+            states[user_id] = ShopBotState.MAIN_MENU
+            return
+        if promo:
+            await database.use_promocode(promo['id'])
+        # Уведомляем продавца и админов магазина через manager_bot — именно там
+        # с ними и зарегистрированы переписки (shop-бот не имеет с ними чата).
+        if manager_bot is not None:
+            admin_ids = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
+            try:
+                user = await bot.get_chat(user_id)
+                username = user.username
+            except Exception:
+                username = None
+            notify_txt = (
+                f"🆕 Новый заказ #{order_id}!\n\n"
+                f"Магазин: {shop_info[2]}\n"
+                f"📦 {title} ×{quantity}{label_suffix} — {total:.2f}₽\n"
+                f"🏠 Адрес: {delivery_addr}\n"
+                f"👤 Покупатель: @{username or 'Не указан'}\n"
+                f"💳 Способ оплаты: {database.payment_method_label('cash_on_delivery')}"
+            )
+            for aid in set(admin_ids):
+                try:
+                    await manager_bot.send_message(aid, notify_txt)
+                except Exception:
+                    pass
+        await bot.send_message(
+            chat_id,
+            f"🛒 Заказ #{order_id} оформлен!\n\n"
+            f"Товар: <b>{title}</b> ×{quantity}{label_suffix}\n"
+            f"💰 Итог: <b>{total:.2f} ₽</b>\n"
+            f"🏠 Адрес: {delivery_addr}\n"
+            f"💵 Оплата при получении\n\n"
+            f"Раздел «📋 Мои заказы» — для отслеживания статуса.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_create_shop_main_menu()
+        )
+        # Цифровой контент при cash доставляется сразу (как и в корзине).
+        order = await database.get_order(order_id)
+        if order and order.get("digital_content"):
+            await _deliver_digital(order, bot)
+        states[user_id] = ShopBotState.MAIN_MENU
+        return
+
     # Платежи делает МЕНЕДЖЕР-БОТ (provider_token Telegram Payments привязан
     # к конкретному боту через @BotFather, поэтому из shop-бота invoice не
     # отправить). Создаём заказ в БД со статусом NEW и передаём покупателя
@@ -284,13 +357,6 @@ async def _send_invoice_for_direct_buy(
         )
         states[user_id] = ShopBotState.MAIN_MENU
         return
-
-    # Цифровой ли товар? — для физических нужен адрес, тут direct_buy
-    # вызывается уже после ввода адреса (или сразу для цифровых).
-    is_digital = bool(product[6]) if len(product) > 6 else True
-    delivery_addr = states.pop(f"{user_id}_address_direct", None)
-    if not delivery_addr:
-        delivery_addr = "Цифровой товар" if is_digital else "Уточняется"
 
     order_id = await database.buy_product(
         shop_id, user_id, product_id, quantity, total,
@@ -432,8 +498,13 @@ async def run_shop_bot(
         # NEW. Поэтому обрабатываем как free order: PAID + payment_method=
         # 'promocode' (баланс продавцу не зачисляется, см. place_cart_order).
         if payment_method == 'online' and total_price < 1.0:
+            # ВАЖНО: передаём 0 в place_cart_order, чтобы баланс продавцу не
+            # зачислялся (в этой ветке заказ оформляется бесплатно по промо).
+            # Остаточная сумма 0.01–0.99 ₽ от _apply_promo иначе попадёт в
+            # credit_seller_balance, поскольку place_cart_order проверяет
+            # только cash_on_delivery, а не promocode.
             group_id, order_ids = await database.place_cart_order(
-                shop_id, customer_id, items, total_price, delivery_address,
+                shop_id, customer_id, items, 0, delivery_address,
                 status=database.ORDER_STATUS_PAID, payment_method='promocode'
             )
             admin_ids = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
@@ -662,7 +733,7 @@ async def run_shop_bot(
                 await call.answer()
                 await _send_invoice_for_direct_buy(
                     call.message.chat.id, user_id, product_id, quantity,
-                    shop_id, bot, states
+                    shop_id, bot, states, manager_bot=manager_bot
                 )
 
             # ── Прямая покупка: начало ──
@@ -1142,7 +1213,8 @@ async def run_shop_bot(
         product_id = states.get(f"{user_id}_product_id")
         quantity   = states.get(f"{user_id}_quantity")
         await _send_invoice_for_direct_buy(
-            message.chat.id, user_id, product_id, quantity, shop_id, bot, states
+            message.chat.id, user_id, product_id, quantity, shop_id, bot, states,
+            manager_bot=manager_bot
         )
 
     @dp.message(F.func(lambda m: states.get(m.from_user.id) == ShopBotState.ENTERING_PROMOCODE), ~F.successful_payment)
