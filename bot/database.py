@@ -1668,7 +1668,15 @@ async def resolve_dispute(dispute_id: int, resolved_by: int,
     elif resolution == "complete":
         new_status = ORDER_STATUS_COMPLETED
     else:  # reject
-        new_status = ORDER_STATUS_PAID
+        # Возврат «куда был». Если заказ никогда не оплачивался (paid_at IS
+        # NULL — например, спор открыли на NEW-заказе ДО оплаты), нельзя
+        # переводить его в PAID: это спровоцировало бы credit_seller_balance
+        # за заказ, по которому реально денег не приходило. Возвращаем такой
+        # заказ обратно в NEW. Если оплата уже была — возвращаем в PAID
+        # (баланс не зачислится повторно благодаря already_paid_once).
+        order_now = await get_order(dispute["order_id"])
+        new_status = (ORDER_STATUS_PAID if (order_now and order_now.get("paid_at"))
+                      else ORDER_STATUS_NEW)
     await update_order_status(dispute["order_id"], new_status)
     return True
 

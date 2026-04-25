@@ -292,8 +292,9 @@ async def _send_invoice_for_direct_buy(
             )
             states[user_id] = ShopBotState.MAIN_MENU
             return
-        if promo:
-            await database.use_promocode(promo['id'])
+        # NB: use_promocode уже вызван выше (после _apply_promo, до проверки
+        # путей оплаты), здесь повторно списывать нельзя — иначе uses_count
+        # инкрементится дважды за одну реальную покупку.
         # Уведомляем продавца и админов магазина через manager_bot — именно там
         # с ними и зарегистрированы переписки (shop-бот не имеет с ними чата).
         if manager_bot is not None:
