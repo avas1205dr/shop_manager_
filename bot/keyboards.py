@@ -170,8 +170,7 @@ def create_remove_worker_menu(shop_id: int, workers) -> InlineKeyboardMarkup:
 def create_confirm_remove_menu(shop_id: int, worker_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
-        text="⚠️ Точно уволить?",
-        callback_data=f"confirm_remove_step2_{shop_id}_{worker_id}"
+        text="┼ТОЧНО?┼", callback_data=f"confirm_remove_step2_{shop_id}_{worker_id}"
     ))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data=f"remove_worker_{shop_id}"))
     return builder.as_markup()
@@ -180,8 +179,7 @@ def create_confirm_remove_menu(shop_id: int, worker_id: int) -> InlineKeyboardMa
 def create_confirm_remove_step2_menu(shop_id: int, worker_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
-        text="🚫 Да, уволить окончательно",
-        callback_data=f"do_remove_{shop_id}_{worker_id}"
+        text="╤╧╨┼УВОЛИТЬ┼╨╧╤", callback_data=f"do_remove_{shop_id}_{worker_id}"
     ))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data=f"remove_worker_{shop_id}"))
     return builder.as_markup()
