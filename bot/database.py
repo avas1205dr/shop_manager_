@@ -1265,10 +1265,16 @@ async def has_complained(shop_id: int, user_id: int) -> bool:
 async def update_product_digital(product_id: int, kind: Optional[str],
                                  content: Optional[str],
                                  ttl_hours: Optional[int]) -> bool:
-    """kind: 'text' | 'url' | 'file_id' | 'photo_id' | None (очистить)."""
+    """kind: 'text' | 'url' | 'photo_path' | 'file_path' | 'photo_id' | 'file_id' | None.
+
+    photo_path/file_path — путь до файла на диске (новый формат, кросс-бот).
+    photo_id/file_id — старый формат, оставлен для обратной совместимости.
+    """
     if not isinstance(product_id, int) or product_id <= 0:
         return False
-    if kind is not None and kind not in ("text", "url", "file_id", "photo_id"):
+    if kind is not None and kind not in (
+        "text", "url", "photo_path", "file_path", "photo_id", "file_id"
+    ):
         return False
     async with _db() as db:
         await db.execute(
