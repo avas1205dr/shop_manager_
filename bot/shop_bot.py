@@ -16,13 +16,14 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
-    CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
     LabeledPrice, Message, PreCheckoutQuery,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
 import database
+import digital_delivery
 import keyboards
 import legal
 from states import ShopBotState
@@ -170,40 +171,24 @@ async def _show_product_detail(chat_id: int, bot: Bot, product_id: int):
 
 
 async def _deliver_digital(order: dict, bot: Bot) -> bool:
-    """Отправляет цифровой контент покупателю и помечает заказ как `delivered`."""
+    """Отправляет цифровой контент покупателю и помечает заказ как `delivered`.
+
+    Поддерживает одиночные элементы и пакеты (kind='bundle' с JSON-списком
+    элементов в content). Делегирует логику в `digital_delivery.deliver_digital`.
+    """
     digital_kind = order.get("digital_content_kind")
     digital      = order.get("digital_content")
     ttl_hours    = order.get("digital_ttl_hours")
-    if not digital:
+    if not digital_kind or not digital:
         return False
     payload_for_log = f"[{digital_kind}] {str(digital)[:200]}"
-    text = f"📤 <b>Ваш товар:</b> {order['product_name']}\n"
+    header = f"📤 <b>Ваш товар:</b> {order['product_name']}"
     if ttl_hours:
-        text += f"⏰ Срок действия: {ttl_hours} ч с момента оплаты.\n"
-    text += "\n"
-    try:
-        if digital_kind == "photo_path":
-            await bot.send_photo(order['customer_user_id'], FSInputFile(digital),
-                                 caption=text or None, parse_mode=ParseMode.HTML)
-        elif digital_kind == "file_path":
-            await bot.send_document(order['customer_user_id'], FSInputFile(digital),
-                                    caption=text or None, parse_mode=ParseMode.HTML)
-        elif digital_kind == "photo_id":
-            # Старые записи: file_id от другого бота. Скорее всего не сработает,
-            # но пробуем ради обратной совместимости.
-            await bot.send_photo(order['customer_user_id'], digital, caption=text or None,
-                                 parse_mode=ParseMode.HTML)
-        elif digital_kind == "file_id":
-            await bot.send_document(order['customer_user_id'], digital, caption=text or None,
-                                    parse_mode=ParseMode.HTML)
-        elif digital_kind == "url":
-            await bot.send_message(order['customer_user_id'], text + f"🔗 {digital}",
-                                   parse_mode=ParseMode.HTML)
-        else:
-            await bot.send_message(order['customer_user_id'], text + str(digital),
-                                   parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Не удалось доставить цифровой контент по заказу {order['id']}: {e}")
+        header += f"\n⏰ Срок действия: {ttl_hours} ч с момента оплаты."
+    sent = await digital_delivery.deliver_digital(
+        bot, order['customer_user_id'], digital_kind, digital, header=header
+    )
+    if not sent:
         return False
     await database.set_order_delivery_payload(order['id'], payload_for_log)
     await database.update_order_status(order['id'], database.ORDER_STATUS_DELIVERED)

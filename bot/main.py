@@ -5,6 +5,7 @@ main.py  —  бот-менеджер (aiogram 3.x)
 """
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -24,6 +25,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
 import database
+import digital_delivery
 import keyboards
 import legal
 import shop_bot as shop_bot_module
@@ -1170,9 +1172,15 @@ async def callback_handler(call: CallbackQuery):
             page        = int(parts[4])
             info = await database.get_product_digital(product_id) or {}
             kind = info.get("kind") or "—"
-            content = info.get("content") or "не задано"
+            content = info.get("content") or ""
             ttl = info.get("ttl_hours")
-            preview = content if isinstance(content, str) and len(content) < 120 else (str(content)[:117] + "...")
+            if kind == "bundle":
+                items = digital_delivery.parse_bundle(content)
+                preview = f"пакет из {len(items)} элементов"
+            elif content:
+                preview = content if isinstance(content, str) and len(content) < 120 else (str(content)[:117] + "...")
+            else:
+                preview = "не задано"
             text = (
                 f"💾 <b>Цифровой контент</b>\n\n"
                 f"Тип: <code>{kind}</code>\n"
@@ -1194,17 +1202,61 @@ async def callback_handler(call: CallbackQuery):
             user_states[_uid(user_id, "product_id")] = product_id
             user_states[_uid(user_id, "category_id")] = category_id
             user_states[_uid(user_id, "page")] = page
-            cancel_kb = InlineKeyboardBuilder()
-            cancel_kb.row(InlineKeyboardButton(
-                text="❌ Отмена",
-                callback_data=f"cancel_edit_digital_{product_id}_{category_id}_{page}"
-            ))
+            user_states[_uid(user_id, "digital_bundle")] = []
             await call.message.edit_text(
-                "📝 Отправьте цифровой контент товара (будет автоматически отправлен покупателю после оплаты):\n\n"
-                "• Текст — любое сообщение\n"
-                "• Ссылка — https://...\n"
-                "• Файл/фото — отправьте вложение",
-                reply_markup=cancel_kb.as_markup()
+                _format_bundle_status(0) + "\n\n" + _BUNDLE_PROMPT,
+                reply_markup=_bundle_edit_kb(product_id, category_id, page, count=0),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data.startswith("dbundle_save_"):
+            parts = data.split("_")
+            product_id  = int(parts[2])
+            category_id = int(parts[3]) if len(parts) > 3 else 0
+            page        = int(parts[4]) if len(parts) > 4 else 0
+            items = user_states.get(_uid(user_id, "digital_bundle")) or []
+            if not items:
+                await call.answer("⚠️ Пакет пуст. Отправьте хотя бы один элемент.", show_alert=True)
+                return
+            existing = await database.get_product_digital(product_id) or {}
+            ttl = existing.get("ttl_hours")
+            if len(items) == 1:
+                # Не плодим bundle ради одного элемента — храним как одиночный.
+                only = items[0]
+                kind, content = only["kind"], only["content"]
+                # Подпись (caption) у одиночного фото/видео/файла теряется при
+                # текущей схеме — но в одиночном режиме это и не редактировалось.
+            else:
+                kind = "bundle"
+                content = digital_delivery.serialize_bundle(items)
+            await database.update_product_digital(product_id, kind, content, ttl)
+            user_states[_uid(user_id, "digital_bundle")] = []
+            user_states[user_id] = UserState.EDITING_PRODUCT
+            digital = await database.get_product_digital(product_id) or {}
+            kind_lbl = "пакет" if digital.get("kind") == "bundle" else (digital.get("kind") or "—")
+            info_text = (
+                f"✅ Цифровой контент сохранён ({len(items)} эл.).\n\n"
+                "💾 <b>Цифровой контент</b>\n"
+                f"Тип: {kind_lbl}\n"
+                f"Срок (ч): {digital.get('ttl_hours') if digital.get('ttl_hours') else '—'}"
+            )
+            await call.message.edit_text(
+                info_text,
+                reply_markup=keyboards.create_digital_content_menu(product_id, category_id, page),
+                parse_mode=ParseMode.HTML
+            )
+
+        elif data.startswith("dbundle_reset_"):
+            parts = data.split("_")
+            product_id  = int(parts[2])
+            category_id = int(parts[3]) if len(parts) > 3 else 0
+            page        = int(parts[4]) if len(parts) > 4 else 0
+            user_states[_uid(user_id, "digital_bundle")] = []
+            await call.answer("🗑 Пакет очищен")
+            await call.message.edit_text(
+                _format_bundle_status(0) + "\n\n" + _BUNDLE_PROMPT,
+                reply_markup=_bundle_edit_kb(product_id, category_id, page, count=0),
+                parse_mode=ParseMode.HTML
             )
 
         elif data.startswith("edit_dttl_"):
@@ -1234,7 +1286,7 @@ async def callback_handler(call: CallbackQuery):
             category_id = int(parts[4]) if len(parts) > 4 else 0
             page        = int(parts[5]) if len(parts) > 5 else 0
             user_states[user_id] = UserState.EDITING_PRODUCT
-            for key in ("product_id", "category_id", "page"):
+            for key in ("product_id", "category_id", "page", "digital_bundle"):
                 user_states.pop(_uid(user_id, key), None)
             user_states[_uid(user_id, "product_id")] = product_id
             user_states[_uid(user_id, "category_id")] = category_id
@@ -2476,37 +2528,30 @@ async def _notify_customer_status_change(order_id: int, new_status: str) -> None
 
 
 async def _deliver_digital_content(order: dict) -> bool:
-    """Отправляет цифровой контент покупателю и помечает заказ как `delivered`."""
+    """Отправляет цифровой контент покупателю и помечает заказ как `delivered`.
+
+    Поддерживает одиночные элементы и пакеты (kind='bundle'). Пытается
+    отправить от имени магазин-бота; при сбое — от менеджер-бота (file_id
+    между ботами не работает, поэтому медиа хранятся как файлы на диске).
+    """
     digital_kind = order.get("digital_content_kind")
     digital      = order.get("digital_content")
     ttl_hours    = order.get("digital_ttl_hours")
-    if not digital:
+    if not digital_kind or not digital:
         return False
-    payload_for_log = f"[{digital_kind}] {digital[:200]}"
-    text = f"📤 <b>Ваш товар:</b> {order['product_name']}\n"
+    header = f"📤 <b>Ваш товар:</b> {order['product_name']}"
     if ttl_hours:
-        text += f"⏰ Срок действия: {ttl_hours} ч с момента оплаты.\n"
-    text += "\n"
-    photo_id = file_id = photo_path = file_path = None
-    if digital_kind == "text":
-        text += digital
-    elif digital_kind == "url":
-        text += f"🔗 {digital}"
-    elif digital_kind == "photo_path":
-        photo_path = digital
-    elif digital_kind == "file_path":
-        file_path = digital
-    elif digital_kind == "photo_id":
-        # Backward compat: старые записи с file_id от менеджер-бота. Будут
-        # работать только при отправке через тот же бот, что загружал.
-        photo_id = digital
-    elif digital_kind == "file_id":
-        file_id = digital
-    else:
-        text += digital  # fallback
-    sent = await _send_via_shop_or_main(order["shop_id"], order["customer_user_id"],
-                                        text, photo_id=photo_id, file_id=file_id,
-                                        photo_path=photo_path, file_path=file_path)
+        header += f"\n⏰ Срок действия: {ttl_hours} ч с момента оплаты."
+    payload_for_log = f"[{digital_kind}] {digital[:200]}"
+    sender = active_shop_bots.get(order["shop_id"]) or bot
+    sent = await digital_delivery.deliver_digital(
+        sender, order["customer_user_id"], digital_kind, digital, header=header
+    )
+    if not sent and sender is not bot:
+        # Шоп-бот не сработал — пробуем платформу.
+        sent = await digital_delivery.deliver_digital(
+            bot, order["customer_user_id"], digital_kind, digital, header=header
+        )
     if sent:
         await database.set_order_delivery_payload(order["id"], payload_for_log)
         await database.update_order_status(order["id"], database.ORDER_STATUS_DELIVERED)
@@ -2549,6 +2594,105 @@ async def _notify_dispute_resolved(dispute_id: int, resolution: str) -> None:
 #  Сообщения: цифровой контент, TTL, ответы по заказу/спору
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── Сборка пакета цифрового контента ───────────────────────────────────────
+# Продавец может прислать произвольное число сообщений (фото / видео / голос
+# / документ / текст / ссылка); все они накапливаются в `digital_bundle`,
+# затем сохраняются как одиночный элемент (если он один) или как пакет
+# kind='bundle' с JSON-списком элементов.
+
+_BUNDLE_PROMPT = (
+    "📝 Отправьте материалы для покупателя. Можно несколько подряд:\n\n"
+    "• текст или ссылка\n"
+    "• фото, видео, голос, кружок, GIF\n"
+    "• документ любого формата (zip, pdf, mp3, apk и т.д.)\n\n"
+    "Когда добавите всё — нажмите «✅ Сохранить»."
+)
+
+
+def _format_bundle_status(count: int) -> str:
+    if count == 0:
+        return "💾 Пакет цифрового контента: <b>пуст</b>"
+    return f"💾 Пакет цифрового контента: <b>{count} эл.</b>"
+
+
+def _bundle_edit_kb(product_id: int, category_id: int, page: int, count: int):
+    builder = InlineKeyboardBuilder()
+    if count > 0:
+        builder.row(InlineKeyboardButton(
+            text=f"✅ Сохранить ({count})",
+            callback_data=f"dbundle_save_{product_id}_{category_id}_{page}"
+        ))
+        builder.row(InlineKeyboardButton(
+            text="🗑 Очистить пакет",
+            callback_data=f"dbundle_reset_{product_id}_{category_id}_{page}"
+        ))
+    builder.row(InlineKeyboardButton(
+        text="❌ Отмена",
+        callback_data=f"cancel_edit_digital_{product_id}_{category_id}_{page}"
+    ))
+    return builder.as_markup()
+
+
+async def _save_message_to_disk(file_id: str, default_ext: str = "",
+                                preferred_name: str = "") -> str:
+    """Скачивает файл с серверов Telegram и кладёт в `digital_content/`.
+
+    Возвращает относительный путь. Имя — uuid-префикс + (preferred_name
+    либо расширение из исходного `file_path`).
+    """
+    os.makedirs("digital_content", exist_ok=True)
+    file_info = await bot.get_file(file_id)
+    file_data = await bot.download_file(file_info.file_path)
+    if preferred_name:
+        path = f"digital_content/{uuid.uuid4().hex}_{preferred_name}"
+    else:
+        ext = os.path.splitext(file_info.file_path)[1] or default_ext
+        path = f"digital_content/{uuid.uuid4().hex}{ext}"
+    with open(path, "wb") as f:
+        f.write(file_data.read())
+    return path
+
+
+async def _extract_digital_item(message: Message) -> Optional[dict]:
+    """Возвращает {"kind": ..., "content": ..., "caption": Optional[str]} или None.
+
+    Поддерживает текст, ссылки, фото, видео, аудио, голос, видеосообщение,
+    анимацию (GIF), документы любого формата.
+    """
+    caption = (message.caption or "").strip() or None
+    if message.photo:
+        path = await _save_message_to_disk(message.photo[-1].file_id, default_ext=".jpg")
+        return {"kind": "photo_path", "content": path, "caption": caption}
+    if message.video:
+        path = await _save_message_to_disk(message.video.file_id, default_ext=".mp4")
+        return {"kind": "video_path", "content": path, "caption": caption}
+    if message.animation:
+        path = await _save_message_to_disk(message.animation.file_id, default_ext=".mp4")
+        return {"kind": "animation_path", "content": path, "caption": caption}
+    if message.audio:
+        name = message.audio.file_name or ""
+        path = await _save_message_to_disk(message.audio.file_id, default_ext=".mp3",
+                                           preferred_name=name)
+        return {"kind": "audio_path", "content": path, "caption": caption}
+    if message.voice:
+        path = await _save_message_to_disk(message.voice.file_id, default_ext=".ogg")
+        return {"kind": "voice_path", "content": path, "caption": caption}
+    if message.video_note:
+        path = await _save_message_to_disk(message.video_note.file_id, default_ext=".mp4")
+        return {"kind": "video_note_path", "content": path, "caption": caption}
+    if message.document:
+        original_name = message.document.file_name or ""
+        path = await _save_message_to_disk(message.document.file_id, default_ext="",
+                                           preferred_name=original_name)
+        return {"kind": "file_path", "content": path, "caption": caption}
+    text = (message.text or "").strip()
+    if text:
+        if text.lower().startswith(("http://", "https://", "tg://")):
+            return {"kind": "url", "content": text, "caption": None}
+        return {"kind": "text", "content": text, "caption": None}
+    return None
+
+
 @dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_DIGITAL_CONTENT), ~F.successful_payment)
 async def handle_edit_digital_content(message: Message):
     user_id    = message.from_user.id
@@ -2559,57 +2703,39 @@ async def handle_edit_digital_content(message: Message):
     text = (message.text or "").strip()
     if text.lower() == "назад":
         user_states[user_id] = UserState.SHOP_MENU
+        user_states[_uid(user_id, "digital_bundle")] = []
         await message.answer("❌ Отменено")
         return
 
-    kind = content = None
-    if message.photo:
-        # Скачиваем фото на диск, чтобы магазин-бот (с другим токеном) мог
-        # переслать его покупателю. Telegram file_id не работает между ботами.
-        os.makedirs("digital_content", exist_ok=True)
-        file_id   = message.photo[-1].file_id
-        file_info = await bot.get_file(file_id)
-        file_data = await bot.download_file(file_info.file_path)
-        ext = os.path.splitext(file_info.file_path)[1] or ".jpg"
-        path = f"digital_content/{uuid.uuid4().hex}{ext}"
-        with open(path, "wb") as f:
-            f.write(file_data.read())
-        kind, content = "photo_path", path
-    elif message.document:
-        os.makedirs("digital_content", exist_ok=True)
-        file_id   = message.document.file_id
-        file_info = await bot.get_file(file_id)
-        file_data = await bot.download_file(file_info.file_path)
-        original_name = message.document.file_name or "file"
-        # сохраняем оригинальное имя через uuid-префикс, чтобы не было коллизий
-        path = f"digital_content/{uuid.uuid4().hex}_{original_name}"
-        with open(path, "wb") as f:
-            f.write(file_data.read())
-        kind, content = "file_path", path
-    elif text:
-        if text.lower().startswith(("http://", "https://", "tg://")):
-            kind, content = "url", text
-        else:
-            kind, content = "text", text
-    if not kind:
-        await message.answer("❌ Отправьте текст, ссылку или вложение")
+    item = await _extract_digital_item(message)
+    if not item:
+        await message.answer(
+            "❌ Не понял, что отправлено. Можно: текст, ссылку, фото, видео, "
+            "аудио, голос, кружок, GIF или документ."
+        )
         return
 
-    await database.update_product_digital(product_id, kind, content,
-                                          (await database.get_product_digital(product_id) or {}).get("ttl_hours"))
+    bundle_key = _uid(user_id, "digital_bundle")
+    items = user_states.get(bundle_key)
+    if not isinstance(items, list):
+        items = []
+    items.append(item)
+    user_states[bundle_key] = items
+
     category_id = user_states.get(_uid(user_id, "category_id"), 0) or 0
     page        = user_states.get(_uid(user_id, "page"), 0) or 0
-    user_states[user_id] = UserState.EDITING_PRODUCT
-    digital = await database.get_product_digital(product_id) or {}
-    info = (
-        f"✅ Цифровой контент сохранён ({kind}).\n\n"
-        "💾 <b>Цифровой контент</b>\n"
-        f"Тип: {digital.get('kind') or '—'}\n"
-        f"Срок (ч): {digital.get('ttl_hours') if digital.get('ttl_hours') else '—'}"
-    )
+    kind_lbl = {
+        "text": "текст", "url": "ссылка",
+        "photo_path": "фото", "video_path": "видео",
+        "audio_path": "аудио", "voice_path": "голосовое",
+        "video_note_path": "кружок", "animation_path": "GIF",
+        "file_path": "файл",
+    }.get(item["kind"], item["kind"])
+
     await message.answer(
-        info,
-        reply_markup=keyboards.create_digital_content_menu(product_id, category_id, page),
+        f"➕ Добавлено: <b>{kind_lbl}</b>\n\n"
+        + _format_bundle_status(len(items)) + "\n\n" + _BUNDLE_PROMPT,
+        reply_markup=_bundle_edit_kb(product_id, category_id, page, count=len(items)),
         parse_mode=ParseMode.HTML
     )
 

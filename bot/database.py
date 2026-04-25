@@ -1338,19 +1338,33 @@ async def has_complained(shop_id: int, user_id: int) -> bool:
 
 # ─────────────────── ЦИФРОВАЯ ДОСТАВКА ───────────────────
 
+DIGITAL_CONTENT_KINDS = (
+    # Одиночные элементы
+    "text", "url",
+    "photo_path", "video_path", "audio_path", "voice_path",
+    "video_note_path", "animation_path", "file_path",
+    # Старые file_id — оставлены ради обратной совместимости с уже сохранённым
+    # цифровым контентом, загруженным до перехода на _path-формат.
+    "photo_id", "file_id",
+    # Пакет из нескольких элементов: content — JSON-список словарей
+    # [{"kind": <одиночный_kind>, "content": <значение>}, ...]
+    "bundle",
+)
+
+
 async def update_product_digital(product_id: int, kind: Optional[str],
                                  content: Optional[str],
                                  ttl_hours: Optional[int]) -> bool:
-    """kind: 'text' | 'url' | 'photo_path' | 'file_path' | 'photo_id' | 'file_id' | None.
+    """kind ∈ DIGITAL_CONTENT_KINDS либо None.
 
-    photo_path/file_path — путь до файла на диске (новый формат, кросс-бот).
-    photo_id/file_id — старый формат, оставлен для обратной совместимости.
+    Для kind='bundle' ожидается, что content — JSON-список элементов.
+    Каждый элемент — {"kind": <одиночный_kind>, "content": <строка>}.
+    Это позволяет хранить произвольное количество фото/видео/файлов/текста
+    как один цифровой товар.
     """
     if not isinstance(product_id, int) or product_id <= 0:
         return False
-    if kind is not None and kind not in (
-        "text", "url", "photo_path", "file_path", "photo_id", "file_id"
-    ):
+    if kind is not None and kind not in DIGITAL_CONTENT_KINDS:
         return False
     # Считаем товар цифровым тогда, когда у него есть и kind, и content.
     # Без is_digital=1 ручная доставка (`_deliver_digital_content`) и
