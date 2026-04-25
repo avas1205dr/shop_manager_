@@ -450,24 +450,31 @@ async def run_shop_bot(
                 pass
 
         if payment_method == 'online':
-            shop_creds = shop_info[9]
-            payment_url = None
-            if shop_creds and ':' in shop_creds:
-                sid, skey = shop_creds.split(':', 1)
-                payment_url = await asyncio.get_event_loop().run_in_executor(
-                    None, database.create_payment_link, total_price, order_ids[0], sid, skey
-                )
-            if payment_url:
+            # Онлайн-оплата корзины идёт через МЕНЕДЖЕР-БОТА (provider_token
+            # Telegram Payments привязан к нему, см. shop_bot._send_invoice_for_direct_buy).
+            # На каждый заказ генерируем deeplink t.me/<manager>?start=pay_<oid>.
+            if not config.PAYMENTS_TOKEN or not config.MANAGER_BOT_USERNAME:
                 await message.answer(
                     f"🛒 Заказ оформлен!\n\n{order_details}\n"
                     f"💰 Итог: {total_price:.2f}₽\n🏠 Адрес: {delivery_address}\n\n"
-                    f"Оплатите заказ по ссылке:\n{payment_url}"
+                    f"❌ Онлайн-оплата временно недоступна. Свяжитесь с продавцом."
                 )
             else:
+                builder = InlineKeyboardBuilder()
+                for oid in order_ids:
+                    o = await database.get_order(oid)
+                    line_total = float(o["total_price"] or 0) if o else 0.0
+                    pay_url = f"https://t.me/{config.MANAGER_BOT_USERNAME}?start=pay_{oid}"
+                    builder.row(InlineKeyboardButton(
+                        text=f"💳 Оплатить заказ #{oid} — {line_total:.2f} ₽",
+                        url=pay_url
+                    ))
                 await message.answer(
                     f"🛒 Заказ оформлен!\n\n{order_details}\n"
                     f"💰 Итог: {total_price:.2f}₽\n🏠 Адрес: {delivery_address}\n\n"
-                    f"❌ Ошибка при создании платежной ссылки"
+                    f"Нажмите кнопку оплаты ниже — вы перейдёте в платёжный бот платформы. "
+                    f"После оплаты заказ перейдёт в статус «оплачен».",
+                    reply_markup=builder.as_markup()
                 )
         else:
             await message.answer(

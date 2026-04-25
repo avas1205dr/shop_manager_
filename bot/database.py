@@ -908,18 +908,28 @@ async def place_cart_order(shop_id: int, customer_id: int, items, total_price: f
         group_id = uuid.uuid4().hex
     paid_at_sql = "CURRENT_TIMESTAMP" if status == ORDER_STATUS_PAID else "NULL"
     order_ids = []
+    # Пропорциональное распределение скидки по строкам корзины: считаем
+    # коэффициент total_price / gross и применяем к каждой позиции. Так сумма
+    # по строкам всегда совпадает с общим итогом, даже когда скидка превышает
+    # стоимость одной из позиций (например, промокод 90% на корзину из двух
+    # товаров).
+    gross = sum(float(p) * int(q) for _pid, _n, p, q in items)
+    ratio = 1.0
+    if total_price is not None and gross > 0:
+        ratio = max(0.0, float(total_price) / gross)
+    line_totals = [round(float(p) * int(q) * ratio, 2)
+                   for _pid, _n, p, q in items]
+    # Округление по строкам может дать копеечную ошибку относительно total_price —
+    # компенсируем разницу на последней строке.
+    if total_price is not None:
+        diff = round(float(total_price) - sum(line_totals), 2)
+        if line_totals:
+            line_totals[-1] = round(line_totals[-1] + diff, 2)
+            if line_totals[-1] < 0:
+                line_totals[-1] = 0
     async with _db() as db:
-        for idx, (pid, _name, price, quantity) in enumerate(items):
-            line_total = float(price) * int(quantity)
-            # Скидку (если есть) кладём пропорционально на первую строку,
-            # чтобы суммарно по группе получился total_price.
-            if idx == 0 and total_price is not None:
-                # Перераспределяем разницу между line_total всех позиций и total_price
-                gross = sum(float(p) * int(q) for _pid, _n, p, q in items)
-                if gross > 0:
-                    line_total = round(line_total + (total_price - gross), 2)
-                    if line_total < 0:
-                        line_total = 0
+        for idx, (pid, _name, _price, quantity) in enumerate(items):
+            line_total = line_totals[idx] if idx < len(line_totals) else 0
             async with db.execute(
                 f"INSERT INTO orders (shop_id, customer_user_id, product_id, quantity, total_price, "
                 f"delivery_address, status, payment_method, order_group_id, updated_at, paid_at) "
@@ -1873,24 +1883,37 @@ async def mark_withdrawal_paid_out(wid: int, owner_note: Optional[str] = None) -
 
 
 async def reject_withdrawal(wid: int, owner_note: Optional[str] = None) -> bool:
-    """Отклоняет вывод и возвращает деньги на баланс продавца. Идемпотентно."""
+    """Отклоняет вывод и возвращает деньги на баланс продавца. Идемпотентно
+    и устойчиво к гонкам: статус меняем атомарно (status='approved' → 'rejected'),
+    и зачисляем средства только если строка реально перешла в rejected. Если
+    параллельный вызов уже обработал тот же wid (rowcount=0), деньги не
+    возвращаем повторно."""
     w = await get_withdrawal(wid)
     if not w or w["status"] != WITHDRAWAL_STATUS_APPROVED:
         return False
+    shop_id = w["shop_id"]
+    amount_kop = int(w["amount_kopecks"] or 0)
     async with _db() as db:
-        # Возвращаем средства
-        await db.execute(
-            "INSERT INTO seller_balances (shop_id, amount_kopecks, total_earned_kopecks, updated_at) "
-            "VALUES (?, ?, 0, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(shop_id) DO UPDATE SET "
-            "  amount_kopecks=amount_kopecks+excluded.amount_kopecks, "
-            "  updated_at=CURRENT_TIMESTAMP",
-            (w["shop_id"], w["amount_kopecks"])
-        )
-        await db.execute(
+        # Сначала атомарный UPDATE с проверкой исходного статуса.
+        async with db.execute(
             "UPDATE withdrawals SET status=?, owner_note=?, processed_at=CURRENT_TIMESTAMP "
-            "WHERE id=?",
-            (WITHDRAWAL_STATUS_REJECTED, owner_note, wid)
-        )
+            "WHERE id=? AND status=?",
+            (WITHDRAWAL_STATUS_REJECTED, owner_note, wid, WITHDRAWAL_STATUS_APPROVED)
+        ) as cur:
+            changed = cur.rowcount > 0
+        if not changed:
+            # Кто-то уже обработал этот вывод — ничего не возвращаем повторно.
+            await db.commit()
+            return False
+        # Только после успешного перевода в rejected возвращаем деньги на баланс.
+        if amount_kop > 0:
+            await db.execute(
+                "INSERT INTO seller_balances (shop_id, amount_kopecks, total_earned_kopecks, updated_at) "
+                "VALUES (?, ?, 0, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(shop_id) DO UPDATE SET "
+                "  amount_kopecks=amount_kopecks+excluded.amount_kopecks, "
+                "  updated_at=CURRENT_TIMESTAMP",
+                (shop_id, amount_kop)
+            )
         await db.commit()
     return True
