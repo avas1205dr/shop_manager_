@@ -706,8 +706,39 @@ async def callback_handler(call: CallbackQuery):
                 reply_markup=keyboards.create_shop_management_menu(shop_id)
             )
 
-        # ── Удаление магазина ──
+        # ── Удаление магазина: шаг 1 (подтверждение) ──
         elif data.startswith("delete_shop_"):
+            shop_id   = int(data.split("_")[-1])
+            shop_info = await database.get_shop_info(shop_id)
+            if not shop_info:
+                await call.answer("Магазин не найден")
+                return
+            if shop_info[1] != user_id:
+                await call.answer("Только создатель магазина может его удалить")
+                return
+            confirm_kb = InlineKeyboardBuilder()
+            confirm_kb.row(InlineKeyboardButton(
+                text="🗑 Да, удалить безвозвратно",
+                callback_data=f"do_delete_shop_{shop_id}"
+            ))
+            confirm_kb.row(InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"manage_shop_{shop_id}"
+            ))
+            await call.message.edit_text(
+                f"⚠️ <b>Удалить магазин «{shop_info[2]}»?</b>\n\n"
+                "Это действие <b>необратимо</b>. Будут удалены:\n"
+                "• сам магазин и его настройки;\n"
+                "• все товары и категории магазина;\n"
+                "• история заказов, отзывов и споров;\n"
+                "• токен бота-витрины.\n\n"
+                "Вывод средств с уже накопленного баланса делайте до удаления.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=confirm_kb.as_markup()
+            )
+
+        # ── Удаление магазина: шаг 2 (фактическое удаление) ──
+        elif data.startswith("do_delete_shop_"):
             shop_id   = int(data.split("_")[-1])
             shop_info = await database.get_shop_info(shop_id)
             if not shop_info:
@@ -822,6 +853,7 @@ async def callback_handler(call: CallbackQuery):
                 reply_markup=keyboards.create_back_button_menu(f"product_{product_id}_{category_id}_{page}")
             )
 
+        # ── Удаление товара: шаг 1 (подтверждение) ──
         elif data.startswith("delete_product_"):
             parts = data.split("_")
             if len(parts) < 5:
@@ -830,6 +862,35 @@ async def callback_handler(call: CallbackQuery):
             product_id  = int(parts[2])
             category_id = int(parts[3])
             page        = int(parts[4])
+            product = await database.get_product_info(product_id)
+            product_name = product[2] if product and len(product) > 2 else f"#{product_id}"
+            confirm_kb = InlineKeyboardBuilder()
+            confirm_kb.row(InlineKeyboardButton(
+                text="🗑 Да, удалить безвозвратно",
+                callback_data=f"do_delete_product_{product_id}_{category_id}_{page}"
+            ))
+            confirm_kb.row(InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"product_{product_id}_{category_id}_{page}"
+            ))
+            await call.message.edit_text(
+                f"⚠️ <b>Удалить товар «{product_name}»?</b>\n\n"
+                "Это действие <b>необратимо</b>: сам товар, его фото и "
+                "цифровой контент будут удалены.\n"
+                "На уже оформленные заказы это не повлияет.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=confirm_kb.as_markup()
+            )
+
+        # ── Удаление товара: шаг 2 (фактическое удаление) ──
+        elif data.startswith("do_delete_product_"):
+            parts = data.split("_")
+            if len(parts) < 6:
+                await call.answer("Неверные данные")
+                return
+            product_id  = int(parts[3])
+            category_id = int(parts[4])
+            page        = int(parts[5])
             await database.delete_product(product_id)
             await call.answer("✅ Товар удалён")
             await call.message.edit_text(
@@ -883,7 +944,30 @@ async def callback_handler(call: CallbackQuery):
                 reply_markup=keyboards.create_back_button_menu(f"category_{category_id}")
             )
 
+        # ── Удаление категории: шаг 1 (подтверждение) ──
         elif data.startswith("delete_category_"):
+            category_id = int(data.split("_")[-1])
+            shop_id     = await database.get_shop_id_by_category(category_id)
+            confirm_kb = InlineKeyboardBuilder()
+            confirm_kb.row(InlineKeyboardButton(
+                text="🗑 Да, удалить безвозвратно",
+                callback_data=f"do_delete_category_{category_id}"
+            ))
+            confirm_kb.row(InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"category_{category_id}"
+            ))
+            await call.message.edit_text(
+                "⚠️ <b>Удалить раздел вместе со всеми товарами в нём?</b>\n\n"
+                "Это действие <b>необратимо</b>: будут удалены все товары "
+                "категории, их фотографии и цифровой контент.\n"
+                "На уже оформленные заказы это не повлияет.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=confirm_kb.as_markup()
+            )
+
+        # ── Удаление категории: шаг 2 (фактическое удаление) ──
+        elif data.startswith("do_delete_category_"):
             category_id = int(data.split("_")[-1])
             shop_id     = await database.get_shop_id_by_category(category_id)
             if await database.delete_category(category_id):
@@ -1220,7 +1304,36 @@ async def callback_handler(call: CallbackQuery):
                     reply_markup=keyboards.create_under_review_list_menu(shops)
                 )
 
-        elif data.startswith("mod_shop_delete_"):
+        # ── Модерация: удаление магазина — шаг 1 (подтверждение) ──
+        elif data.startswith("mod_shop_delete_") and not data.startswith("mod_shop_delete_do_"):
+            if not config.is_owner(user_id):
+                await call.answer("⛔ Удалять магазины может только владелец")
+                return
+            shop_id = int(data.split("_")[-1])
+            shop_info = await database.get_shop_info(shop_id)
+            if not shop_info:
+                await call.answer("Магазин не найден")
+                return
+            confirm_kb = InlineKeyboardBuilder()
+            confirm_kb.row(InlineKeyboardButton(
+                text="🗑 Да, удалить безвозвратно",
+                callback_data=f"mod_shop_delete_do_{shop_id}"
+            ))
+            confirm_kb.row(InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"mod_shop_{shop_id}"
+            ))
+            await call.message.edit_text(
+                f"⚠️ <b>Удалить магазин «{shop_info[2]}»?</b>\n\n"
+                "Действие <b>необратимо</b>. Будут удалены товары, категории, "
+                "заказы, отзывы и токен бота. Владельцу магазина будет отправлено "
+                "уведомление об удалении.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=confirm_kb.as_markup()
+            )
+
+        # ── Модерация: удаление магазина — шаг 2 (фактическое удаление) ──
+        elif data.startswith("mod_shop_delete_do_"):
             if not config.is_owner(user_id):
                 await call.answer("⛔ Удалять магазины может только владелец")
                 return
