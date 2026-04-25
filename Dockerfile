@@ -41,11 +41,16 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 # Минимальные runtime-пакеты: tzdata для корректной TZ, ca-certificates для
 # исходящих HTTPS к api.telegram.org, tini как PID 1 (правильное проксирование
 # сигналов и reaping zombie-процессов).
+# tini  — PID 1 (проксирует сигналы, reaping zombie-процессов).
+# tzdata, ca-certificates — временная зона и HTTPS к api.telegram.org.
+# gosu  — даёт entrypoint'у возможность безопасно дропнуться в app:app
+#         ПОСЛЕ chown'а на смонтированные тома.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         tini \
         tzdata \
         ca-certificates \
+        gosu \
  && rm -rf /var/lib/apt/lists/*
 
 # Не-root пользователь. uid:gid 1000:1000 совместимы с типичными
@@ -73,17 +78,22 @@ RUN mkdir -p /data/db /data/digital_content /data/product_images \
  && ln -s /data/product_images  /app/product_images \
  && chown -R app:app /data /app
 
-USER app
+# Entrypoint стартует от root, выравнивает права на свеже смонтированных
+# bind-mount'ах (их владелец на хосте — обычно root) и дропается в
+# app:app через gosu. USER app в Dockerfile НЕ выставляем — иначе chown
+# в entrypoint'е невозможен.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 VOLUME ["/data"]
 
 # Хелсчек: процесс жив + БД доступна. Telegram-бот не слушает порт, поэтому
 # проверяем минимальный invariant — модуль импортируется и БД открывается.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=20s --retries=3 \
-    CMD python -c "import sqlite3, os; sqlite3.connect(os.environ.get('DB_PATH','/data/db/shop_manager.db')).execute('SELECT 1').fetchone()" \
+    CMD gosu app:app python -c "import sqlite3, os; sqlite3.connect(os.environ.get('DB_PATH','/data/db/shop_manager.db')).execute('SELECT 1').fetchone()" \
         || exit 1
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 # Запускаем как скрипт (а не -m), чтобы bot/ оказался на sys.path и
 # работали top-level импорты `import config`, `import database` и т.п.
 CMD ["python", "bot/main.py"]
