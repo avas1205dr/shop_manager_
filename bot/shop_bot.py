@@ -380,7 +380,12 @@ async def run_shop_bot(
                 content      = review_text or "Без текста"
                 text += f"👤 {user_display} ({clean_date})\n{s}\n💬 {content}\n\n"
         markup = keyboards.create_shop_reviews_pagination(page, total_count)
-        await bot.edit_message_text(text, chat_id, message_id, reply_markup=markup)
+        # В aiogram 3.x edit_message_text принимает только первый позиционный
+        # аргумент (text). Остальные ОБЯЗАТЕЛЬНО kwargs, иначе chat_id попадает
+        # в business_connection_id и ловим pydantic ValidationError.
+        await bot.edit_message_text(
+            text=text, chat_id=chat_id, message_id=message_id, reply_markup=markup
+        )
 
     async def _handle_delivery_address_logic(message: Message, customer_id: int):
         delivery_address = message.text.strip()
