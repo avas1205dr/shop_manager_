@@ -1716,7 +1716,10 @@ async def handle_promo_value_input(message: Message):
 
 # ── Универсальный текстовый обработчик ──
 
-@dp.message()
+# ВАЖНО: исключаем successful_payment, иначе этот catch-all перехватывает
+# сервисное сообщение об успешной оплате раньше, чем @dp.message(F.successful_payment)
+# ниже, и мы не успеваем пометить заказ как PAID и зачислить баланс продавцу.
+@dp.message(~F.successful_payment)
 async def text_handler(message: Message):
     user_id    = message.from_user.id
     user_state = user_states.get(user_id)
@@ -1935,9 +1938,13 @@ async def text_handler(message: Message):
 
         if message.text and message.text.strip().lower() == 'назад':
             await message.answer("❌ Изменение товара отменено")
-            await message.answer("📦 Товары в разделе:",
-                                 reply_markup=await keyboards.create_products_menu(category_id, page))
-            user_states[user_id] = UserState.SHOP_MENU
+            # Возвращаемся к меню РЕДАКТИРОВАНИЯ ТОВАРА (уровнем выше),
+            # а не в общий список товаров — так удобнее продолжать правки.
+            await message.answer(
+                "Выберите действие:",
+                reply_markup=keyboards.create_edit_product_menu(product_id, category_id, page)
+            )
+            user_states[user_id] = UserState.EDITING_PRODUCT
             return
 
         if not message.text:
@@ -1994,9 +2001,17 @@ async def text_handler(message: Message):
                     await message.answer("❌ Введите число (цену) или '-' чтобы убрать скидку:")
                     return
 
-        await message.answer("📦 Товары в разделе:",
-                             reply_markup=await keyboards.create_products_menu(category_id, page))
-        user_states[user_id] = UserState.SHOP_MENU
+        # После любого изменения свойства товара возвращаем меню редактирования
+        # самого товара, чтобы можно было сразу поправить ещё одно поле без
+        # лишней навигации (раньше выкидывало в список товаров и SHOP_MENU).
+        await message.answer(
+            "Выберите действие:",
+            reply_markup=keyboards.create_edit_product_menu(product_id, category_id, page)
+        )
+        user_states[user_id] = UserState.EDITING_PRODUCT
+        # Очищаем только тип правки — id товара/категории/страница нужны
+        # для корректной работы меню при повторных кликах.
+        user_states.pop(_uid(user_id, "edit_type"), None)
     else:
         await message.answer("Используйте кнопки меню для навигации:", reply_markup=keyboards.create_main_menu())
 
@@ -2072,9 +2087,13 @@ async def handle_edit_product_photo(message: Message):
             logger.error(f"Ошибка удаления старого изображения: {e}")
 
     await message.answer("✅ Фото товара обновлено!")
-    await message.answer("📦 Товары в разделе:",
-                         reply_markup=await keyboards.create_products_menu(category_id, page))
-    user_states[user_id] = UserState.SHOP_MENU
+    # Возврат к меню редактирования товара (уровень выше), а не к списку.
+    await message.answer(
+        "Выберите действие:",
+        reply_markup=keyboards.create_edit_product_menu(product_id, category_id, page)
+    )
+    user_states[user_id] = UserState.EDITING_PRODUCT
+    user_states.pop(_uid(user_id, "edit_type"), None)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
