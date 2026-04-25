@@ -16,7 +16,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+    CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
     LabeledPrice, Message, PreCheckoutQuery,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -182,7 +182,15 @@ async def _deliver_digital(order: dict, bot: Bot) -> bool:
         text += f"⏰ Срок действия: {ttl_hours} ч с момента оплаты.\n"
     text += "\n"
     try:
-        if digital_kind == "photo_id":
+        if digital_kind == "photo_path":
+            await bot.send_photo(order['customer_user_id'], FSInputFile(digital),
+                                 caption=text or None, parse_mode=ParseMode.HTML)
+        elif digital_kind == "file_path":
+            await bot.send_document(order['customer_user_id'], FSInputFile(digital),
+                                    caption=text or None, parse_mode=ParseMode.HTML)
+        elif digital_kind == "photo_id":
+            # Старые записи: file_id от другого бота. Скорее всего не сработает,
+            # но пробуем ради обратной совместимости.
             await bot.send_photo(order['customer_user_id'], digital, caption=text or None,
                                  parse_mode=ParseMode.HTML)
         elif digital_kind == "file_id":
@@ -237,13 +245,23 @@ async def _send_invoice_for_direct_buy(
         total = discounted
 
         if total < 1.0:
-            await database.use_promocode(promo['id'])
+            # Создаём заказ ДО списания промокода: если БД упадёт, промокод
+            # не будет считаться использованным.
             order_id = await database.buy_product(
                 shop_id, user_id, product_id, quantity, 0,
                 'Цифровой товар (промокод 100%)',
                 status=database.ORDER_STATUS_PAID,
                 payment_method='promocode'
             )
+            if not order_id:
+                await bot.send_message(
+                    chat_id,
+                    "❌ Не удалось оформить заказ. Попробуйте позже.",
+                    reply_markup=_create_shop_main_menu()
+                )
+                states[user_id] = ShopBotState.MAIN_MENU
+                return
+            await database.use_promocode(promo['id'])
             await bot.send_message(
                 chat_id,
                 f"✅ Заказ #{order_id}: <b>{title}</b> ×{quantity} оформлен бесплатно по промокоду "
@@ -251,7 +269,7 @@ async def _send_invoice_for_direct_buy(
                 parse_mode=ParseMode.HTML,
                 reply_markup=_create_shop_main_menu()
             )
-            order = await database.get_order(order_id) if order_id else None
+            order = await database.get_order(order_id)
             if order and order.get("digital_content"):
                 await _deliver_digital(order, bot)
             states[user_id] = ShopBotState.MAIN_MENU

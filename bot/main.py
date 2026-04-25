@@ -1761,11 +1761,24 @@ def _format_order_for_admin(order: dict) -> str:
 
 async def _send_via_shop_or_main(shop_id: int, customer_id: int, text: str,
                                  photo_id: Optional[str] = None,
-                                 file_id: Optional[str] = None) -> bool:
-    """Пытается отправить от имени магазин-бота, иначе — от менеджера."""
+                                 file_id: Optional[str] = None,
+                                 photo_path: Optional[str] = None,
+                                 file_path: Optional[str] = None) -> bool:
+    """Пытается отправить от имени магазин-бота, иначе — от менеджера.
+
+    `photo_path`/`file_path` — локальные файлы (FSInputFile). Используются для
+    цифрового контента, который нельзя пересылать между разными ботами по
+    Telegram file_id.
+    """
     sender = active_shop_bots.get(shop_id) or bot
     try:
-        if photo_id:
+        if photo_path:
+            await sender.send_photo(customer_id, FSInputFile(photo_path),
+                                    caption=text or None, parse_mode=ParseMode.HTML)
+        elif file_path:
+            await sender.send_document(customer_id, FSInputFile(file_path),
+                                       caption=text or None, parse_mode=ParseMode.HTML)
+        elif photo_id:
             await sender.send_photo(customer_id, photo_id, caption=text or None,
                                     parse_mode=ParseMode.HTML)
         elif file_id:
@@ -1804,19 +1817,26 @@ async def _deliver_digital_content(order: dict) -> bool:
     if ttl_hours:
         text += f"⏰ Срок действия: {ttl_hours} ч с момента оплаты.\n"
     text += "\n"
-    photo_id = file_id = None
+    photo_id = file_id = photo_path = file_path = None
     if digital_kind == "text":
         text += digital
     elif digital_kind == "url":
         text += f"🔗 {digital}"
+    elif digital_kind == "photo_path":
+        photo_path = digital
+    elif digital_kind == "file_path":
+        file_path = digital
     elif digital_kind == "photo_id":
+        # Backward compat: старые записи с file_id от менеджер-бота. Будут
+        # работать только при отправке через тот же бот, что загружал.
         photo_id = digital
     elif digital_kind == "file_id":
         file_id = digital
     else:
         text += digital  # fallback
     sent = await _send_via_shop_or_main(order["shop_id"], order["customer_user_id"],
-                                        text, photo_id=photo_id, file_id=file_id)
+                                        text, photo_id=photo_id, file_id=file_id,
+                                        photo_path=photo_path, file_path=file_path)
     if sent:
         await database.set_order_delivery_payload(order["id"], payload_for_log)
         await database.update_order_status(order["id"], database.ORDER_STATUS_DELIVERED)
@@ -1841,7 +1861,10 @@ async def _notify_dispute_resolved(dispute_id: int, resolution: str) -> None:
         f"PayMaster/ЮKassa в течение 3 рабочих дней."
     )
     await _send_via_shop_or_main(d["shop_id"], order["customer_user_id"], customer_msg)
-    seller_id = (await database.get_shop_info(d["shop_id"]))[1]
+    shop_info = await database.get_shop_info(d["shop_id"])
+    if not shop_info:
+        return
+    seller_id = shop_info[1]
     try:
         await bot.send_message(
             seller_id,
@@ -1871,9 +1894,28 @@ async def handle_edit_digital_content(message: Message):
 
     kind = content = None
     if message.photo:
-        kind, content = "photo_id", message.photo[-1].file_id
+        # Скачиваем фото на диск, чтобы магазин-бот (с другим токеном) мог
+        # переслать его покупателю. Telegram file_id не работает между ботами.
+        os.makedirs("digital_content", exist_ok=True)
+        file_id   = message.photo[-1].file_id
+        file_info = await bot.get_file(file_id)
+        file_data = await bot.download_file(file_info.file_path)
+        ext = os.path.splitext(file_info.file_path)[1] or ".jpg"
+        path = f"digital_content/{uuid.uuid4().hex}{ext}"
+        with open(path, "wb") as f:
+            f.write(file_data.read())
+        kind, content = "photo_path", path
     elif message.document:
-        kind, content = "file_id", message.document.file_id
+        os.makedirs("digital_content", exist_ok=True)
+        file_id   = message.document.file_id
+        file_info = await bot.get_file(file_id)
+        file_data = await bot.download_file(file_info.file_path)
+        original_name = message.document.file_name or "file"
+        # сохраняем оригинальное имя через uuid-префикс, чтобы не было коллизий
+        path = f"digital_content/{uuid.uuid4().hex}_{original_name}"
+        with open(path, "wb") as f:
+            f.write(file_data.read())
+        kind, content = "file_path", path
     elif text:
         if text.lower().startswith(("http://", "https://", "tg://")):
             kind, content = "url", text

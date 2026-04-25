@@ -60,7 +60,9 @@ DISPUTE_STATUS_CANCELED = "canceled"
 # ─────────────────── ИНИЦИАЛИЗАЦИЯ (sync, вызывается один раз) ───────────────────
 
 def init_database():
-    os.makedirs("db", exist_ok=True)
+    db_dir = os.path.dirname(DB_NAME)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.executescript("""
