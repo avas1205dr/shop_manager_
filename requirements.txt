@@ -29,4 +29,3 @@ urllib3
 wheel
 wrapt
 yarl
-yookassa

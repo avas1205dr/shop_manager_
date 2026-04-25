@@ -446,7 +446,7 @@ async def run_shop_bot(
             f"🆕 Новый заказ!\n\nМагазин: {shop_info[2]}\n{order_details}\n"
             f"💰 Итог: {total_price:.2f}₽\n🏠 Адрес: {delivery_address}\n"
             f"👤 Покупатель: @{message.from_user.username or 'Не указан'}\n"
-            f"💳 Способ оплаты: {payment_method}"
+            f"💳 Способ оплаты: {database.payment_method_label(payment_method)}"
         )
         for aid in set(admin_ids):
             try:
@@ -896,7 +896,7 @@ async def run_shop_bot(
                     f"Товар: <b>{order['product_name']}</b>\n"
                     f"Кол-во: {order['quantity']}\n"
                     f"Сумма: {order['total_price']}₽\n"
-                    f"Способ оплаты: {order['payment_method'] or '—'}\n"
+                    f"Способ оплаты: {database.payment_method_label(order['payment_method'])}\n"
                     f"Адрес: {order['delivery_address']}\n"
                     f"Статус: {label}\n"
                     f"Создан: {order['created_at']}\n"

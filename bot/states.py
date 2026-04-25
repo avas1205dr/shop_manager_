@@ -11,7 +11,6 @@ class UserState:
     PRODUCT_TYPE = "product_type"
     PRODUCT_DESCRIPTION = "product_description"
     PRODUCT_IMAGE = "product_image"
-    EDITING_PAYMENT = "editing_payment"
     ADDING_ADMIN = "adding_admin"
     GET_USER_ID = "get_user_id"
     EDITING_PRODUCT = "editing_product"
@@ -20,7 +19,6 @@ class UserState:
     REMOVING_WORKER = "removing_worker"
     EDITING_CATEGORY_NAME = "editing_category_name"
     DELETING_CATEGORY = "deleting_category"
-    EDITING_PAYMASTER = "editing_paymaster"
     BROADCAST_MESSAGE = "broadcast_message"
 
     # Промокоды

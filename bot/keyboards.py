@@ -170,7 +170,8 @@ def create_remove_worker_menu(shop_id: int, workers) -> InlineKeyboardMarkup:
 def create_confirm_remove_menu(shop_id: int, worker_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
-        text="┼ТОЧНО?┼", callback_data=f"confirm_remove_step2_{shop_id}_{worker_id}"
+        text="⚠️ Точно уволить?",
+        callback_data=f"confirm_remove_step2_{shop_id}_{worker_id}"
     ))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data=f"remove_worker_{shop_id}"))
     return builder.as_markup()
@@ -179,7 +180,8 @@ def create_confirm_remove_menu(shop_id: int, worker_id: int) -> InlineKeyboardMa
 def create_confirm_remove_step2_menu(shop_id: int, worker_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(
-        text="╤╧╨┼УВОЛИТЬ┼╨╧╤", callback_data=f"do_remove_{shop_id}_{worker_id}"
+        text="🚫 Да, уволить окончательно",
+        callback_data=f"do_remove_{shop_id}_{worker_id}"
     ))
     builder.row(InlineKeyboardButton(text="❌ Отмена", callback_data=f"remove_worker_{shop_id}"))
     return builder.as_markup()
@@ -188,13 +190,15 @@ def create_confirm_remove_step2_menu(shop_id: int, worker_id: int) -> InlineKeyb
 # ─────────────────── ЗАКАЗЫ ───────────────────
 
 def create_orders_menu(shop_id: int, orders, page: int = 0, per_page: int = 5) -> InlineKeyboardMarkup:
+    from database import ORDER_STATUS_LABELS
     builder = InlineKeyboardBuilder()
     start = page * per_page
     end = min(start + per_page, len(orders))
     for order in orders[start:end]:
         order_id, _, product_name, quantity, total_price, _, status, _, username = order
+        label_status = ORDER_STATUS_LABELS.get(status, status)
         builder.row(InlineKeyboardButton(
-            text=f"#{order_id} {product_name} x{quantity} - {status}",
+            text=f"#{order_id} {product_name} ×{quantity} — {label_status}",
             callback_data=f"order_detail_{order_id}"
         ))
     nav = []

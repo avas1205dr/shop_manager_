@@ -16,7 +16,6 @@ from functools import wraps
 from typing import List, Optional
 
 import aiosqlite
-from yookassa import Configuration, Payment
 
 import config
 
@@ -46,6 +45,20 @@ ORDER_STATUS_LABELS = {
     ORDER_STATUS_REFUNDED:         "💸 Возвращён",
     ORDER_STATUS_DISPUTED:         "⚖️ Спор",
 }
+
+# ── Способы оплаты (человекочитаемые названия для UI) ──
+PAYMENT_METHOD_LABELS = {
+    "online":             "💳 Онлайн через платформу",
+    "platform_invoice":   "💳 Онлайн через платформу",
+    "cash_on_delivery":   "💵 Оплата при получении",
+}
+
+
+def payment_method_label(method: Optional[str]) -> str:
+    """Преобразует код способа оплаты в человекочитаемую метку."""
+    if not method:
+        return "—"
+    return PAYMENT_METHOD_LABELS.get(method, method)
 
 # ── Статусы магазина ──
 SHOP_STATUS_ACTIVE       = "active"
@@ -509,14 +522,13 @@ async def update_welcome_message(shop_id: int, message: str) -> bool:
 
 
 async def update_payment_method(shop_id: int, method: str, credentials: Optional[str] = None):
+    # Параметр `credentials` оставлен ради обратной совместимости со старыми
+    # местами вызова (раньше сюда передавали ShopID:SecretKey ЮKassa).
+    # Сейчас онлайн-оплата идёт через единый PAYMENTS_TOKEN платформы и
+    # никаких per-shop credentials не требуется.
+    del credentials
     async with _db() as db:
-        if credentials:
-            await db.execute(
-                "UPDATE shops SET payment_method=?, yookassa_credentials=? WHERE id=?",
-                (method, credentials, shop_id)
-            )
-        else:
-            await db.execute("UPDATE shops SET payment_method=? WHERE id=?", (method, shop_id))
+        await db.execute("UPDATE shops SET payment_method=? WHERE id=?", (method, shop_id))
         await db.commit()
 
 
@@ -1109,42 +1121,10 @@ async def has_user_reviewed(shop_id: int, user_id: int) -> bool:
 
 # ─────────────────── ПЛАТЕЖИ ───────────────────
 
-async def update_paymaster_token(shop_id: int, token: str) -> bool:
-    if not isinstance(shop_id, int) or shop_id <= 0:
-        return False
-    if not token or len(token) < 10:
-        return False
-    async with _db() as db:
-        await db.execute("UPDATE shops SET paymaster_token=? WHERE id=?", (token, shop_id))
-        await db.commit()
-    return True
-
-
-async def get_paymaster_token_by_shop_id(shop_id: int) -> Optional[str]:
-    if not isinstance(shop_id, int) or shop_id <= 0:
-        return None
-    async with _db() as db:
-        async with db.execute("SELECT paymaster_token FROM shops WHERE id=?", (shop_id,)) as cur:
-            row = await cur.fetchone()
-    return row[0] if row else None
-
-
-def create_payment_link(amount: float, product_id: int, shop_id_yk: str, secret_key: str) -> Optional[str]:
-    """Синхронная — yookassa SDK не поддерживает async."""
-    try:
-        Configuration.account_id = shop_id_yk
-        Configuration.secret_key = secret_key
-        payment = Payment.create({
-            "amount": {"value": str(amount), "currency": "RUB"},
-            "confirmation": {"type": "redirect", "return_url": "https://your-site.com/return"},
-            "capture": True,
-            "description": f"Оплата товара #{product_id}",
-            "metadata": {"product_id": product_id}
-        }, uuid.uuid4().hex)
-        return payment.confirmation.confirmation_url
-    except Exception as e:
-        logging.error(f"Ошибка создания платежа: {e}")
-        return None
+# Колонки `paymaster_token` и `yookassa_credentials` остаются в схеме для
+# обратной совместимости с существующими БД, но не используются: онлайн-оплата
+# теперь идёт через единый PAYMENTS_TOKEN платформы (см. config.PAYMENTS_TOKEN
+# и main.py: _send_payment_invoice* / manager_successful_payment).
 
 
 # ─────────────────── ПРОМОКОДЫ ───────────────────

@@ -100,19 +100,20 @@ async def _stop_shop_bot(shop_id: int):
 
 WELCOME_TEXT = (
     "🛍️ Добро пожаловать в Shop Manager Bot!\n\n"
-    "Этот бот поможет вам создать и управлять собственными магазинными ботами в Telegram.\n\n"
-    "Для того чтобы настроить ваш магазин нужно:\n"
-    "• Создать магазин в нашем боте\n"
-    "• Создать бота через @BotFather, скопировать API-токен и вставить в разделе API бота\n"
-    "• Также в @BotFather настроить Payments (инструкция есть в разделе Paymaster) и отправить токен\n"
-    "• Добавить работников, товары, категории и т.д.\n"
-    "• Готово!\n\n\n"
-    "Возможности:\n"
-    "• Создание неограниченного количества магазинов\n"
-    "• Управление товарами и категориями\n"
-    "• Настройка способов оплаты\n"
-    "• Просмотр отзывов и рейтингов\n\n"
-    "Команды: /terms /legal /moderation\n\n"
+    "Этот бот поможет вам создать и управлять собственными магазинами в Telegram.\n\n"
+    "<b>Как запустить свой магазин за 3 шага:</b>\n"
+    "1️⃣ Создайте магазин в этом боте — кнопка «🏪 Мои магазины».\n"
+    "2️⃣ Получите токен бота-витрины через @BotFather и вставьте его "
+    "в разделе «🔑 API токен» вашего магазина.\n"
+    "3️⃣ Добавьте категории, товары (можно цифровые — будут отправляться "
+    "покупателю автоматически после оплаты) и пригласите работников.\n\n"
+    "<b>Платежи:</b>\n"
+    "• <b>Онлайн через платформу</b> — деньги зачисляются на ваш внутренний "
+    "баланс, выводятся через раздел «💰 Финансы». Подключать собственный "
+    "платёжный токен не нужно.\n"
+    "• <b>Оплата при получении</b> — расчёты напрямую между вами и покупателем.\n\n"
+    "Команды: /terms — правила, /legal — запрещённые товары, "
+    "/moderation — модерация (для админов).\n\n"
     "Выберите действие:"
 )
 
@@ -515,6 +516,7 @@ async def callback_handler(call: CallbackQuery):
                 await call.answer("Нет доступа", show_alert=True)
                 return
             bal = await database.get_seller_balance(shop_id)
+            shop_payment_method = shop_info[4] if len(shop_info) > 4 else None
             text = (
                 f"💰 <b>Финансы — {shop_info[2]}</b>\n\n"
                 f"Доступно к выводу: <b>{bal['amount_rub']:.2f} ₽</b>\n"
@@ -523,6 +525,20 @@ async def callback_handler(call: CallbackQuery):
                 f"Платежи покупателей принимаются единым PayMaster платформы; "
                 f"фактическую выплату делает владелец платформы после вашего запроса."
             )
+            # Подсказка: если магазин стоит на «оплате при получении», деньги
+            # никогда не пройдут через платформу и баланс будет всегда 0.
+            # Если продавец зашёл сюда с пустым балансом — намекаем, как это
+            # изменить.
+            if (bal['amount_rub'] == 0 and bal['total_earned_rub'] == 0
+                    and shop_payment_method == 'cash_on_delivery'):
+                text += (
+                    "\n\n💡 <b>Почему здесь 0 ₽?</b>\n"
+                    "Сейчас в магазине включён способ <b>«Оплата при получении»</b> — "
+                    "деньги идут напрямую от покупателя продавцу и через платформу не "
+                    "проходят. Чтобы накапливать баланс и выводить его через платформу, "
+                    "переключите способ оплаты на <b>«Онлайн через платформу»</b> в "
+                    "разделе «💳 Способ оплаты»."
+                )
             await call.message.edit_text(text, parse_mode=ParseMode.HTML,
                                          reply_markup=keyboards.create_finance_menu(shop_id))
 
@@ -1087,25 +1103,68 @@ async def callback_handler(call: CallbackQuery):
 
         elif data.startswith("edit_digital_"):
             parts = data.split("_")
-            product_id = int(parts[2])
+            product_id  = int(parts[2])
+            category_id = int(parts[3]) if len(parts) > 3 else 0
+            page        = int(parts[4]) if len(parts) > 4 else 0
             user_states[user_id] = UserState.EDITING_DIGITAL_CONTENT
             user_states[_uid(user_id, "product_id")] = product_id
+            user_states[_uid(user_id, "category_id")] = category_id
+            user_states[_uid(user_id, "page")] = page
+            cancel_kb = InlineKeyboardBuilder()
+            cancel_kb.row(InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"cancel_edit_digital_{product_id}_{category_id}_{page}"
+            ))
             await call.message.edit_text(
                 "📝 Отправьте цифровой контент товара (будет автоматически отправлен покупателю после оплаты):\n\n"
                 "• Текст — любое сообщение\n"
                 "• Ссылка — https://...\n"
-                "• Файл/фото — отправьте вложение\n\n"
-                "Отправьте «назад» для отмены."
+                "• Файл/фото — отправьте вложение",
+                reply_markup=cancel_kb.as_markup()
             )
 
         elif data.startswith("edit_dttl_"):
             parts = data.split("_")
-            product_id = int(parts[2])
+            product_id  = int(parts[2])
+            category_id = int(parts[3]) if len(parts) > 3 else 0
+            page        = int(parts[4]) if len(parts) > 4 else 0
             user_states[user_id] = UserState.EDITING_DIGITAL_TTL
             user_states[_uid(user_id, "product_id")] = product_id
+            user_states[_uid(user_id, "category_id")] = category_id
+            user_states[_uid(user_id, "page")] = page
+            cancel_kb = InlineKeyboardBuilder()
+            cancel_kb.row(InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=f"cancel_edit_digital_{product_id}_{category_id}_{page}"
+            ))
             await call.message.edit_text(
                 "⏰ Введите срок действия цифрового контента в часах (целое число ≥ 0).\n"
-                "Отправьте 0 или «убрать» чтобы убрать срок."
+                "Отправьте 0 или «убрать» чтобы убрать срок.",
+                reply_markup=cancel_kb.as_markup()
+            )
+
+        elif data.startswith("cancel_edit_digital_"):
+            # Inline-«Отмена» из меню редактирования цифрового контента/TTL.
+            parts = data.split("_")
+            product_id  = int(parts[3])
+            category_id = int(parts[4]) if len(parts) > 4 else 0
+            page        = int(parts[5]) if len(parts) > 5 else 0
+            user_states[user_id] = UserState.EDITING_PRODUCT
+            for key in ("product_id", "category_id", "page"):
+                user_states.pop(_uid(user_id, key), None)
+            user_states[_uid(user_id, "product_id")] = product_id
+            user_states[_uid(user_id, "category_id")] = category_id
+            user_states[_uid(user_id, "page")] = page
+            digital = await database.get_product_digital(product_id) or {}
+            text = (
+                "💾 <b>Цифровой контент</b>\n\n"
+                f"Тип: {digital.get('kind') or '—'}\n"
+                f"Срок (ч): {digital.get('ttl_hours') if digital.get('ttl_hours') else '—'}"
+            )
+            await call.message.edit_text(
+                text,
+                reply_markup=keyboards.create_digital_content_menu(product_id, category_id, page),
+                parse_mode=ParseMode.HTML
             )
 
         elif data.startswith("clear_digital_"):
@@ -1587,28 +1646,6 @@ async def add_worker_handler(message: Message):
     user_states[user_id] = UserState.SHOP_MENU
 
 
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_PAYMASTER), ~F.successful_payment)
-async def save_paymaster_token(message: Message):
-    user_id = message.from_user.id
-    shop_id = user_states.get(_uid(user_id, "shop_id"))
-    token   = message.text.strip()
-
-    if token.lower() == 'назад':
-        user_states[user_id] = UserState.SHOP_MENU
-        await message.answer("❌ Настройка PayMaster отменена",
-                             reply_markup=keyboards.create_shop_management_menu(shop_id))
-        return
-    if len(token) < 10:
-        await message.answer("❌ Токен слишком короткий. Попробуйте снова или отправьте 'назад' для отмены")
-        return
-    if await database.update_paymaster_token(shop_id, token):
-        await message.answer("✅ PayMaster токен успешно сохранен!",
-                             reply_markup=keyboards.create_shop_management_menu(shop_id))
-    else:
-        await message.answer("❌ Ошибка при сохранении токена")
-    user_states[user_id] = UserState.SHOP_MENU
-
-
 @dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.WITHDRAW_AMOUNT), ~F.successful_payment)
 async def handle_withdraw_amount(message: Message):
     user_id = message.from_user.id
@@ -1740,26 +1777,6 @@ async def handle_withdraw_reject_note(message: Message):
             )
         except Exception:
             pass
-
-
-@dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_PAYMENT), ~F.successful_payment)
-async def save_payment_credentials(message: Message):
-    user_id     = message.from_user.id
-    shop_id     = user_states.get(_uid(user_id, "shop_id"))
-    credentials = message.text.strip()
-
-    if credentials.lower() == 'назад':
-        user_states[user_id] = UserState.SHOP_MENU
-        await message.answer("❌ Настройка оплаты отменена",
-                             reply_markup=keyboards.create_shop_management_menu(shop_id))
-        return
-    if ":" not in credentials:
-        await message.answer("❌ Формат неверный. Введите ShopID:SecretKey или 'назад' для отмены")
-        return
-    await database.update_payment_method(shop_id, "online", credentials)
-    await message.answer("✅ Настройки ЮKassa сохранены!",
-                         reply_markup=keyboards.create_shop_management_menu(shop_id))
-    user_states[user_id] = UserState.SHOP_MENU
 
 
 @dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.ADDING_PROMO_CODE), ~F.successful_payment)
@@ -2282,7 +2299,7 @@ def _format_order_for_admin(order: dict) -> str:
         f"Товар: <b>{order['product_name']}</b>\n"
         f"Кол-во: {order['quantity']}\n"
         f"Сумма: {order['total_price']}₽\n"
-        f"Способ оплаты: {order['payment_method'] or 'не указан'}\n"
+        f"Способ оплаты: {database.payment_method_label(order['payment_method'])}\n"
         f"Адрес/контакт: {order['delivery_address']}\n"
         f"Создан: {order['created_at']}\n"
     )
@@ -2467,8 +2484,21 @@ async def handle_edit_digital_content(message: Message):
 
     await database.update_product_digital(product_id, kind, content,
                                           (await database.get_product_digital(product_id) or {}).get("ttl_hours"))
-    user_states[user_id] = UserState.SHOP_MENU
-    await message.answer(f"✅ Цифровой контент сохранён ({kind})")
+    category_id = user_states.get(_uid(user_id, "category_id"), 0) or 0
+    page        = user_states.get(_uid(user_id, "page"), 0) or 0
+    user_states[user_id] = UserState.EDITING_PRODUCT
+    digital = await database.get_product_digital(product_id) or {}
+    info = (
+        f"✅ Цифровой контент сохранён ({kind}).\n\n"
+        "💾 <b>Цифровой контент</b>\n"
+        f"Тип: {digital.get('kind') or '—'}\n"
+        f"Срок (ч): {digital.get('ttl_hours') if digital.get('ttl_hours') else '—'}"
+    )
+    await message.answer(
+        info,
+        reply_markup=keyboards.create_digital_content_menu(product_id, category_id, page),
+        parse_mode=ParseMode.HTML
+    )
 
 
 @dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.EDITING_DIGITAL_TTL), ~F.successful_payment)
@@ -2499,8 +2529,21 @@ async def handle_edit_digital_ttl(message: Message):
     info = await database.get_product_digital(product_id) or {}
     await database.update_product_digital(product_id, info.get("kind"), info.get("content"),
                                           ttl if ttl > 0 else None)
-    user_states[user_id] = UserState.SHOP_MENU
-    await message.answer("✅ Срок действия сохранён" if ttl > 0 else "✅ Срок действия убран")
+    category_id = user_states.get(_uid(user_id, "category_id"), 0) or 0
+    page        = user_states.get(_uid(user_id, "page"), 0) or 0
+    user_states[user_id] = UserState.EDITING_PRODUCT
+    digital = await database.get_product_digital(product_id) or {}
+    msg = (
+        ("✅ Срок действия сохранён.\n\n" if ttl > 0 else "✅ Срок действия убран.\n\n") +
+        "💾 <b>Цифровой контент</b>\n"
+        f"Тип: {digital.get('kind') or '—'}\n"
+        f"Срок (ч): {digital.get('ttl_hours') if digital.get('ttl_hours') else '—'}"
+    )
+    await message.answer(
+        msg,
+        reply_markup=keyboards.create_digital_content_menu(product_id, category_id, page),
+        parse_mode=ParseMode.HTML
+    )
 
 
 @dp.message(F.func(lambda m: user_states.get(m.from_user.id) == UserState.REPLYING_DISPUTE), ~F.successful_payment)
