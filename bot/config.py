@@ -5,15 +5,53 @@ config.py — загрузка настроек из переменных окр
 не должен попадать в репозиторий (см. .gitignore). Шаблон лежит в `.env.example`.
 """
 
+import logging
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-except ImportError:
-    pass
+# Диагностика: куда именно мы посмотрели и какой `.env` подхватили.
+ENV_FILE_LOADED: Optional[str] = None
+ENV_PATHS_TRIED: List[str] = []
+
+
+def _load_env_file() -> None:
+    """Ищет `.env` в нескольких вероятных местах и загружает первый найденный."""
+    global ENV_FILE_LOADED, ENV_PATHS_TRIED
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+
+    candidates: List[Path] = []
+    here = Path(__file__).resolve()
+    candidates.append(here.parent.parent / ".env")              # <repo>/.env
+    candidates.append(here.parent / ".env")                     # <repo>/bot/.env
+    try:
+        candidates.append(Path.cwd() / ".env")                  # CWD/.env
+    except OSError:
+        pass
+
+    seen: set = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if str(resolved) in seen:
+            continue
+        seen.add(str(resolved))
+        ENV_PATHS_TRIED.append(str(resolved))
+        if resolved.is_file():
+            # override=True: перезаписываем существующие переменные окружения
+            # на значения из .env (полезно при перезапуске из IDE).
+            load_dotenv(resolved, override=True)
+            ENV_FILE_LOADED = str(resolved)
+            return
+
+
+_load_env_file()
 
 
 def _parse_id_list(raw: str) -> List[int]:
@@ -69,8 +107,17 @@ def is_moderator(user_id: int) -> bool:
 
 
 def assert_bot_token() -> None:
-    """Бросает RuntimeError, если BOT_TOKEN не задан."""
-    if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN не задан. Создайте файл .env (см. .env.example) и пропишите BOT_TOKEN."
-        )
+    """Бросает RuntimeError, если BOT_TOKEN не задан, и пишет диагностику путей."""
+    if BOT_TOKEN:
+        if ENV_FILE_LOADED:
+            logging.getLogger(__name__).info("Загружен .env: %s", ENV_FILE_LOADED)
+        return
+    tried = "\n".join(f"  - {p}" for p in ENV_PATHS_TRIED) or "  (поиск не выполнялся — нет python-dotenv?)"
+    raise RuntimeError(
+        "BOT_TOKEN не задан.\n"
+        "Я искал .env в следующих местах:\n"
+        f"{tried}\n"
+        f"Найден и загружен: {ENV_FILE_LOADED or 'НЕТ'}\n\n"
+        "Положите файл .env (см. .env.example) рядом с папкой bot/ и пропишите BOT_TOKEN.\n"
+        "На Windows проверьте, что файл назван именно `.env` (без `.txt` на конце) и в кодировке UTF-8 без BOM."
+    )
