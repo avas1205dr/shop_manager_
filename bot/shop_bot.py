@@ -266,7 +266,9 @@ async def _send_invoice_for_direct_buy(
                 await _deliver_digital(order, bot)
             states[user_id] = ShopBotState.MAIN_MENU
             return
-        await database.use_promocode(promo['id'])
+        # NB: use_promocode для путей online/cash вызывается ниже — после
+        # того как заказ реально создан. Если упадёт PAYMENTS_TOKEN-проверка
+        # или buy_product, пользователь не теряет одно использование промокода.
 
     # Цифровой ли товар? — для физических нужен адрес, тут direct_buy
     # вызывается уже после ввода адреса (или сразу для цифровых).
@@ -292,9 +294,11 @@ async def _send_invoice_for_direct_buy(
             )
             states[user_id] = ShopBotState.MAIN_MENU
             return
-        # NB: use_promocode уже вызван выше (после _apply_promo, до проверки
-        # путей оплаты), здесь повторно списывать нельзя — иначе uses_count
-        # инкрементится дважды за одну реальную покупку.
+        # Списываем промокод ТОЛЬКО после успешного создания заказа,
+        # чтобы при ошибке в бизнес-пути (PAYMENTS_TOKEN, buy_product) исполь-
+        # зование не сгорало впустую.
+        if promo:
+            await database.use_promocode(promo['id'])
         # Уведомляем продавца и админов магазина через manager_bot — именно там
         # с ними и зарегистрированы переписки (shop-бот не имеет с ними чата).
         if manager_bot is not None:
@@ -373,6 +377,9 @@ async def _send_invoice_for_direct_buy(
         )
         states[user_id] = ShopBotState.MAIN_MENU
         return
+    # Списываем промокод ТОЛЬКО после успешного создания заказа.
+    if promo:
+        await database.use_promocode(promo['id'])
 
     pay_url = f"https://t.me/{config.MANAGER_BOT_USERNAME}?start=pay_{order_id}"
     builder = InlineKeyboardBuilder()
