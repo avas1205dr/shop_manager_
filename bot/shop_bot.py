@@ -497,7 +497,9 @@ async def run_shop_bot(
                            else f"-{int(promo['discount_value'])}₽")
             order_details += f"\n🎟️ Промокод {promo['code']} ({disc_str}): скидка {saved:.2f}₽"
             total_price = discounted
-            await database.use_promocode(promo['id'])
+            # NB: use_promocode вызывается ПОСЛЕ успешного place_cart_order
+            # в каждой из веток (free / cash / online), чтобы при сбое СУБД
+            # использование промокода не сгорало впустую (без реальных заказов).
             states.pop(f"{customer_id}_promo", None)
 
         # Если итог после промокода ниже минимальной суммы Telegram Payments
@@ -515,6 +517,13 @@ async def run_shop_bot(
                 shop_id, customer_id, items, 0, delivery_address,
                 status=database.ORDER_STATUS_PAID, payment_method='promocode'
             )
+            if not order_ids:
+                await message.answer(
+                    "❌ Не удалось оформить заказ. Попробуйте позже."
+                )
+                return
+            if promo:
+                await database.use_promocode(promo['id'])
             admin_ids = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
             free_notify_txt = (
                 f"🎉 Заказ оформлен бесплатно по промокоду!\n\n"
@@ -550,6 +559,14 @@ async def run_shop_bot(
             shop_id, customer_id, items, total_price, delivery_address,
             status=initial_status, payment_method=payment_method
         )
+        if not order_ids:
+            await message.answer(
+                "❌ Не удалось оформить заказ. Попробуйте позже."
+            )
+            return
+        # Списываем промокод ТОЛЬКО после успешного создания заказов.
+        if promo:
+            await database.use_promocode(promo['id'])
 
         # Уведомляем администраторов через manager_bot
         admin_ids  = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
