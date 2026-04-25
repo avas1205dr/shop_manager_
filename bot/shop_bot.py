@@ -507,7 +507,13 @@ async def run_shop_bot(
         # _send_payment_invoice_group отказал бы, оставив заказы навсегда в
         # NEW. Поэтому обрабатываем как free order: PAID + payment_method=
         # 'promocode' (баланс продавцу не зачисляется, см. place_cart_order).
-        if payment_method == 'online' and total_price < 1.0:
+        # ВНИМАНИЕ: ветка free-by-promo обязательно гарантируется наличием
+        # промокода. Без guard'а `promo` корзина с естественной суммой < 1 ₽
+        # (товары по 0.50 ₽ и т.п.) проваливалась бы сюда и оформлялась
+        # бесплатно «по промокоду», которого не было — продавец терял бы
+        # деньги. Если же товаров на < 1 ₽ нет промо — отказываем явно
+        # ниже elif.
+        if payment_method == 'online' and total_price < 1.0 and promo:
             # ВАЖНО: передаём 0 в place_cart_order, чтобы баланс продавцу не
             # зачислялся (в этой ветке заказ оформляется бесплатно по промо).
             # Остаточная сумма 0.01–0.99 ₽ от _apply_promo иначе попадёт в
@@ -548,6 +554,16 @@ async def run_shop_bot(
                     await _deliver_digital(order, bot)
             await database.clear_cart(shop_id, customer_id)
             states[customer_id] = ShopBotState.MAIN_MENU
+            return
+
+        # Естественная сумма корзины < 1 ₽ без промокода — Telegram Payments
+        # отвергнет invoice. Отказываем явно, чтобы не создавать неоплачиваемые
+        # NEW-заказы и не уйти в free-by-promo ветку выше.
+        if payment_method == 'online' and total_price < 1.0:
+            await message.answer(
+                "❌ Сумма корзины меньше минимальной для онлайн-оплаты "
+                "(1 ₽). Добавьте товаров или выберите оплату при получении."
+            )
             return
 
         # Cash → cразу processing+paid (продавец подтвердит при отгрузке);
