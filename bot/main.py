@@ -120,44 +120,74 @@ WELCOME_TEXT = (
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
+    # Deeplink распарсиваем ДО проверки правил, чтобы при первом заходе
+    # покупатель не терял намерение «оплатить корзину/заказ» после принятия
+    # правил. Сохраняем deeplink в user_states и обрабатываем его сразу
+    # после accept_terms.
+    raw = (message.text or "")
+    parts = raw.split(maxsplit=1)
+    pending_deeplink: Optional[str] = None
+    if len(parts) == 2:
+        arg = parts[1]
+        if arg.startswith("pay_g_") and arg[len("pay_g_"):]:
+            pending_deeplink = arg
+        elif arg.startswith("pay_"):
+            try:
+                int(arg.split("_", 1)[1])
+                pending_deeplink = arg
+            except (ValueError, IndexError):
+                pending_deeplink = None
+    if pending_deeplink:
+        user_states[_uid(user_id, "pending_pay_arg")] = pending_deeplink
     if not await _ensure_terms(user_id, message.from_user.username, message.chat.id):
         return
-    # Deeplink-оплата из магазин-ботов: /start pay_<order_id>
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) == 2 and parts[1].startswith("pay_"):
-        try:
-            order_id = int(parts[1].split("_", 1)[1])
-        except (ValueError, IndexError):
-            order_id = 0
-        if order_id:
-            await _send_payment_invoice(message, order_id)
-            return
+    # Правила приняты — обрабатываем deeplink (если был) и выходим.
+    if pending_deeplink:
+        user_states.pop(_uid(user_id, "pending_pay_arg"), None)
+        await _handle_pay_deeplink(message.chat.id, user_id, pending_deeplink)
+        return
     user_states[user_id] = UserState.MAIN_MENU
     await message.answer(WELCOME_TEXT, reply_markup=keyboards.create_main_menu())
 
 
-async def _send_payment_invoice(message: Message, order_id: int) -> None:
+async def _handle_pay_deeplink(chat_id: int, user_id: int, arg: str) -> None:
+    """Маршрутизирует pay_*-аргумент `/start` в нужный invoice-генератор."""
+    if arg.startswith("pay_g_"):
+        group_id = arg[len("pay_g_"):]
+        if group_id:
+            await _send_payment_invoice_group(chat_id, user_id, group_id)
+            return
+    if arg.startswith("pay_"):
+        try:
+            order_id = int(arg.split("_", 1)[1])
+        except (ValueError, IndexError):
+            return
+        if order_id:
+            await _send_payment_invoice(chat_id, user_id, order_id)
+
+
+async def _send_payment_invoice(chat_id: int, user_id: int, order_id: int) -> None:
     """Отправляет invoice через PAYMENTS_TOKEN для заказа из магазин-бота."""
-    user_id = message.from_user.id
     order = await database.get_order(order_id)
     if not order:
-        await message.answer("❌ Заказ не найден.")
+        await bot.send_message(chat_id, "❌ Заказ не найден.")
         return
     if order["customer_user_id"] != user_id:
-        await message.answer("❌ Этот заказ оформлен другим пользователем.")
+        await bot.send_message(chat_id, "❌ Этот заказ оформлен другим пользователем.")
         return
     if order["status"] != database.ORDER_STATUS_NEW:
-        await message.answer(
+        await bot.send_message(
+            chat_id,
             f"ℹ️ Заказ #{order_id} уже в статусе «{database.ORDER_STATUS_LABELS.get(order['status'], order['status'])}». "
             f"Повторная оплата не нужна."
         )
         return
     if not config.PAYMENTS_TOKEN:
-        await message.answer("❌ Онлайн-оплата временно недоступна. Сообщите продавцу.")
+        await bot.send_message(chat_id, "❌ Онлайн-оплата временно недоступна. Сообщите продавцу.")
         return
     total = float(order["total_price"] or 0)
     if total <= 0:
-        await message.answer("❌ Некорректная сумма заказа.")
+        await bot.send_message(chat_id, "❌ Некорректная сумма заказа.")
         return
     price_kopecks = int(round(total * 100))
     # Telegram Payments требует минимум 1 RUB и максимум ~99999 RUB.
@@ -166,7 +196,8 @@ async def _send_payment_invoice(message: Message, order_id: int) -> None:
     # PAYMENT_AMOUNT_INVALID на копеечных строках корзины. Теперь просто
     # отказываем в оплате через Telegram, если сумма меньше минимума.
     if price_kopecks < 100:
-        await message.answer(
+        await bot.send_message(
+            chat_id,
             "❌ Сумма заказа меньше минимально допустимой для онлайн-оплаты "
             "(1 ₽). Пожалуйста, обратитесь к продавцу."
         )
@@ -177,7 +208,8 @@ async def _send_payment_invoice(message: Message, order_id: int) -> None:
     # ("Сумма не совпадает с заказом"). Корректнее сразу отказать с
     # понятным сообщением и не отправлять заведомо нерабочий счёт.
     if price_kopecks > 9_999_900:
-        await message.answer(
+        await bot.send_message(
+            chat_id,
             "❌ Сумма заказа превышает максимально допустимую для онлайн-оплаты "
             "(99 999 ₽). Разделите покупку или обратитесь к продавцу."
         )
@@ -190,7 +222,7 @@ async def _send_payment_invoice(message: Message, order_id: int) -> None:
     payload = f"order_{order_id}"
     try:
         await bot.send_invoice(
-            chat_id=message.chat.id,
+            chat_id=chat_id,
             title=title,
             description=desc,
             payload=payload,
@@ -201,8 +233,90 @@ async def _send_payment_invoice(message: Message, order_id: int) -> None:
         )
     except Exception as e:
         logger.error(f"send_invoice failed for order {order_id}: {e}")
-        await message.answer(
+        await bot.send_message(
+            chat_id,
             "❌ Не удалось создать счёт на оплату. Попробуйте позже или свяжитесь с продавцом."
+        )
+
+
+async def _send_payment_invoice_group(chat_id: int, user_id: int, group_id: str) -> None:
+    """Один invoice на всю корзину (order_group_id).
+
+    Все NEW-заказы в группе, принадлежащие пользователю, складываются в один
+    счёт со списком позиций (LabeledPrice на каждый order). После оплаты
+    manager_successful_payment переведёт всю группу в PAID и зачислит баланс.
+    """
+    orders = await database.get_orders_by_group(group_id)
+    if not orders:
+        await bot.send_message(chat_id, "❌ Корзина не найдена.")
+        return
+    # Только NEW-заказы данного пользователя; остальные игнорируем.
+    pending = [o for o in orders
+               if o["customer_user_id"] == user_id
+               and o["status"] == database.ORDER_STATUS_NEW]
+    if not pending:
+        # Заказы либо уже оплачены, либо принадлежат другому пользователю.
+        if any(o["customer_user_id"] != user_id for o in orders):
+            await bot.send_message(chat_id, "❌ Эта корзина оформлена другим пользователем.")
+            return
+        await bot.send_message(
+            chat_id,
+            f"ℹ️ Корзина уже обработана (заказов в статусе «новый» нет). "
+            f"Откройте «📋 Мои заказы» в магазине для проверки статусов."
+        )
+        return
+    if not config.PAYMENTS_TOKEN:
+        await bot.send_message(chat_id, "❌ Онлайн-оплата временно недоступна. Сообщите продавцу.")
+        return
+    total_kopecks = 0
+    prices: list[LabeledPrice] = []
+    for o in pending:
+        line_kop = int(round(float(o["total_price"] or 0) * 100))
+        if line_kop <= 0:
+            continue
+        total_kopecks += line_kop
+        # Telegram ограничивает label до 32 символов.
+        label = (f"#{o['id']} {o.get('product_name') or 'Товар'} ×{o['quantity']}")[:32]
+        prices.append(LabeledPrice(label=label, amount=line_kop))
+    if not prices or total_kopecks <= 0:
+        await bot.send_message(chat_id, "❌ Сумма корзины некорректна.")
+        return
+    if total_kopecks < 100:
+        await bot.send_message(
+            chat_id,
+            "❌ Сумма корзины меньше минимально допустимой для онлайн-оплаты "
+            "(1 ₽). Пожалуйста, обратитесь к продавцу."
+        )
+        return
+    if total_kopecks > 9_999_900:
+        await bot.send_message(
+            chat_id,
+            "❌ Сумма корзины превышает максимально допустимую для онлайн-оплаты "
+            "(99 999 ₽). Разделите покупку или обратитесь к продавцу."
+        )
+        return
+    shop_name = pending[0].get("shop_name") or "—"
+    title = f"Корзина в «{shop_name}»"[:32]
+    desc = (f"Оплата {len(pending)} "
+            f"{'позиции' if 1 < len(pending) < 5 else ('позиция' if len(pending) == 1 else 'позиций')} "
+            f"в магазине «{shop_name}»")[:255]
+    payload = f"group_{group_id}"
+    try:
+        await bot.send_invoice(
+            chat_id=chat_id,
+            title=title,
+            description=desc,
+            payload=payload,
+            provider_token=config.PAYMENTS_TOKEN,
+            currency="RUB",
+            prices=prices,
+            start_parameter=f"pay_g_{group_id}",
+        )
+    except Exception as e:
+        logger.error(f"send_invoice failed for group {group_id}: {e}")
+        await bot.send_message(
+            chat_id,
+            "❌ Не удалось создать счёт на оплату корзины. Попробуйте позже или свяжитесь с продавцом."
         )
 
 
@@ -1194,10 +1308,24 @@ async def callback_handler(call: CallbackQuery):
         elif data == "terms_accept":
             await database.accept_terms(user_id, legal.TERMS_VERSION)
             user_states[user_id] = UserState.MAIN_MENU
-            await call.message.edit_text(
-                "✅ Спасибо! Правила приняты.\n\n" + WELCOME_TEXT,
-                reply_markup=keyboards.create_main_menu()
-            )
+            # Если перед принятием правил у пользователя был pay-deeplink
+            # (он пришёл по ссылке /start pay_… из магазин-бота), сразу
+            # выставляем счёт, а не показываем большое приветствие — иначе
+            # ему придётся снова идти в магазин и кликать ту же ссылку.
+            pending_arg = user_states.pop(_uid(user_id, "pending_pay_arg"), None)
+            if pending_arg:
+                try:
+                    await call.message.edit_text(
+                        "✅ Спасибо! Правила приняты. Сейчас откроется окно оплаты."
+                    )  # noqa: E501
+                except Exception:
+                    pass
+                await _handle_pay_deeplink(call.message.chat.id, user_id, pending_arg)
+            else:
+                await call.message.edit_text(
+                    "✅ Спасибо! Правила приняты.\n\n" + WELCOME_TEXT,
+                    reply_markup=keyboards.create_main_menu()
+                )
 
         # ── Рассылка ──
         elif data.startswith("broadcast_"):
@@ -2431,6 +2559,32 @@ async def handle_admin_reply(message: Message):
 @dp.pre_checkout_query()
 async def manager_pre_checkout(query: PreCheckoutQuery):
     payload = query.invoice_payload or ""
+    # ── Группа заказов (корзина) ──
+    if payload.startswith("group_"):
+        group_id = payload[len("group_"):]
+        if not group_id:
+            await query.answer(ok=False, error_message="Некорректная корзина.")
+            return
+        orders = await database.get_orders_by_group(group_id)
+        if not orders:
+            await query.answer(ok=False, error_message="Корзина не найдена.")
+            return
+        pending = [o for o in orders
+                   if o["customer_user_id"] == query.from_user.id
+                   and o["status"] == database.ORDER_STATUS_NEW]
+        if not pending:
+            await query.answer(ok=False, error_message="Корзина уже оплачена или отменена.")
+            return
+        if any(o["customer_user_id"] != query.from_user.id for o in orders):
+            await query.answer(ok=False, error_message="Корзина принадлежит другому пользователю.")
+            return
+        expected = sum(int(round(float(o["total_price"] or 0) * 100)) for o in pending)
+        if query.total_amount != expected:
+            await query.answer(ok=False, error_message="Сумма не совпадает с корзиной.")
+            return
+        await query.answer(ok=True)
+        return
+    # ── Одиночный заказ ──
     order_id = 0
     if payload.startswith("order_"):
         try:
@@ -2457,9 +2611,94 @@ async def manager_pre_checkout(query: PreCheckoutQuery):
     await query.answer(ok=True)
 
 
+async def _process_successful_group_payment(message: Message, group_id: str) -> None:
+    """Обрабатывает успешную оплату корзины (group_id): переводит все заказы
+    группы в PAID, начисляет баланс продавцу, доставляет цифру и шлёт ОДНО
+    итоговое уведомление покупателю и админам магазина."""
+    if not group_id:
+        await message.answer("✅ Платёж получен, но корзина не определена.")
+        return
+    orders = await database.get_orders_by_group(group_id)
+    pending = [o for o in orders
+               if o["customer_user_id"] == message.from_user.id
+               and o["status"] == database.ORDER_STATUS_NEW]
+    if not pending:
+        await message.answer("✅ Платёж получен, но эта корзина уже была обработана.")
+        return
+    paid_ids: list[int] = []
+    digital_orders: list[dict] = []
+    total = 0.0
+    shop_id = pending[0]["shop_id"]
+    shop_name = pending[0].get("shop_name") or f"shop#{shop_id}"
+    for o in pending:
+        ok = await database.update_order_status(o["id"], database.ORDER_STATUS_PAID)
+        if ok:
+            paid_ids.append(o["id"])
+            total += float(o["total_price"] or 0)
+            fresh = await database.get_order(o["id"])
+            if fresh and fresh.get("digital_content"):
+                digital_orders.append(fresh)
+    # 1. Покупателю в МЕНЕДЖЕР-боте — единое подтверждение.
+    try:
+        ids_str = ", ".join(f"#{i}" for i in paid_ids) or "—"
+        await message.answer(
+            f"✅ Корзина оплачена!\n"
+            f"Магазин: {shop_name}\n"
+            f"Заказы: {ids_str}\n"
+            f"Сумма: {total:.2f} ₽\n\n"
+            f"Возвращайтесь в магазин-бот — статусы заказов обновлены."
+        )
+    except Exception as e:
+        logger.error(f"manager notify buyer (group) failed for {group_id}: {e}")
+    # 2. Покупателю в МАГАЗИН-боте — дублируем, если бот поднят.
+    shop_sender = active_shop_bots.get(shop_id)
+    if shop_sender:
+        try:
+            await shop_sender.send_message(
+                pending[0]["customer_user_id"],
+                f"💳 Корзина оплачена!\n"
+                f"Заказы: {', '.join(f'#{i}' for i in paid_ids)}\n"
+                f"Сумма: {total:.2f} ₽\n"
+                f"Подробности — в разделе «Мои заказы»."
+            )
+        except Exception as e:
+            logger.error(f"shop-bot notify buyer (group) failed for {group_id}: {e}")
+    # 3. Цифровая доставка по каждой строке.
+    for o in digital_orders:
+        try:
+            await _deliver_digital_content(o)
+        except Exception as e:
+            logger.error(f"digital delivery failed for order {o['id']}: {e}")
+    # 4. Продавцу/админам — одно итоговое уведомление по корзине.
+    admin_ids: list[int] = []
+    shop_info = await database.get_shop_info(shop_id)
+    if shop_info:
+        admin_ids = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
+    notify_text = (
+        f"💳 Поступила оплата корзины\n"
+        f"Магазин: {shop_name}\n"
+        f"Заказы: {', '.join(f'#{i}' for i in paid_ids)} ({len(paid_ids)} поз.)\n"
+        f"Сумма: <b>{total:.2f} ₽</b> → начислено на ваш баланс платформы."
+    )
+    for aid in set(admin_ids):
+        try:
+            await bot.send_message(aid, notify_text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logger.error(f"manager notify admin {aid} failed for group {group_id}: {e}")
+        if shop_sender:
+            try:
+                await shop_sender.send_message(aid, notify_text, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logger.error(f"shop-bot notify admin {aid} failed for group {group_id}: {e}")
+
+
 @dp.message(F.successful_payment)
 async def manager_successful_payment(message: Message):
     payload = message.successful_payment.invoice_payload or ""
+    # ── Группа заказов (корзина) ──
+    if payload.startswith("group_"):
+        await _process_successful_group_payment(message, payload[len("group_"):])
+        return
     if not payload.startswith("order_"):
         await message.answer("✅ Платёж получен.")
         return

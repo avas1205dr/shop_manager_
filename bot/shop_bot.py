@@ -457,7 +457,10 @@ async def run_shop_bot(
         if payment_method == 'online':
             # Онлайн-оплата корзины идёт через МЕНЕДЖЕР-БОТА (provider_token
             # Telegram Payments привязан к нему, см. shop_bot._send_invoice_for_direct_buy).
-            # На каждый заказ генерируем deeplink t.me/<manager>?start=pay_<oid>.
+            # Раньше мы давали покупателю по кнопке на каждую позицию корзины
+            # (5 товаров → 5 переходов в менеджер-бота → 5 invoice'ов). Теперь
+            # делаем один общий deeplink на group_id; в менеджер-боте по нему
+            # формируется один invoice со списком позиций.
             if not config.PAYMENTS_TOKEN or not config.MANAGER_BOT_USERNAME:
                 await message.answer(
                     f"🛒 Заказ оформлен!\n\n{order_details}\n"
@@ -465,20 +468,18 @@ async def run_shop_bot(
                     f"❌ Онлайн-оплата временно недоступна. Свяжитесь с продавцом."
                 )
             else:
+                pay_url = f"https://t.me/{config.MANAGER_BOT_USERNAME}?start=pay_g_{group_id}"
                 builder = InlineKeyboardBuilder()
-                for oid in order_ids:
-                    o = await database.get_order(oid)
-                    line_total = float(o["total_price"] or 0) if o else 0.0
-                    pay_url = f"https://t.me/{config.MANAGER_BOT_USERNAME}?start=pay_{oid}"
-                    builder.row(InlineKeyboardButton(
-                        text=f"💳 Оплатить заказ #{oid} — {line_total:.2f} ₽",
-                        url=pay_url
-                    ))
+                builder.row(InlineKeyboardButton(
+                    text=f"💳 Оплатить корзину — {total_price:.2f} ₽",
+                    url=pay_url
+                ))
                 await message.answer(
                     f"🛒 Заказ оформлен!\n\n{order_details}\n"
                     f"💰 Итог: {total_price:.2f}₽\n🏠 Адрес: {delivery_address}\n\n"
-                    f"Нажмите кнопку оплаты ниже — вы перейдёте в платёжный бот платформы. "
-                    f"После оплаты заказ перейдёт в статус «оплачен».",
+                    f"Нажмите кнопку оплаты ниже — вы перейдёте в платёжный бот платформы "
+                    f"и оплатите корзину одним счётом. После оплаты статусы заказов "
+                    f"автоматически станут «оплачено».",
                     reply_markup=builder.as_markup()
                 )
         else:
