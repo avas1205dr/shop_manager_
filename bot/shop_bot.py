@@ -276,32 +276,65 @@ async def _send_invoice_for_direct_buy(
             return
         await database.use_promocode(promo['id'])
 
-    # Все платежи идут через ЕДИНЫЙ PayMaster платформы (PAYMENTS_TOKEN из .env).
-    # Деньги попадают на счёт владельца платформы; продавцу зачисляется
-    # внутренний баланс, который он позже выводит запросом.
-    payment_token = config.PAYMENTS_TOKEN
-    if not payment_token:
+    # Платежи делает МЕНЕДЖЕР-БОТ (provider_token Telegram Payments привязан
+    # к конкретному боту через @BotFather, поэтому из shop-бота invoice не
+    # отправить). Создаём заказ в БД со статусом NEW и передаём покупателя
+    # по deeplink в менеджер-бот, где он оплатит invoice.
+    if not config.PAYMENTS_TOKEN:
         await bot.send_message(
             chat_id,
-            "❌ Оплата на платформе временно недоступна. Обратитесь в поддержку.",
+            "❌ Онлайн-оплата на платформе временно недоступна. "
+            "Свяжитесь с продавцом для оплаты при получении.",
             reply_markup=_create_shop_main_menu()
         )
         states[user_id] = ShopBotState.MAIN_MENU
         return
 
-    price_kopecks = int(round(total * 100))
-    price_kopecks = max(100, min(price_kopecks, 9_999_900))
-    payload = f"product_{product_id}_user_{user_id}_quantity_{quantity}"
+    if not config.MANAGER_BOT_USERNAME:
+        await bot.send_message(
+            chat_id,
+            "❌ Платёжный шлюз не сконфигурирован (MANAGER_BOT_USERNAME пуст). "
+            "Сообщите владельцу платформы.",
+            reply_markup=_create_shop_main_menu()
+        )
+        states[user_id] = ShopBotState.MAIN_MENU
+        return
 
-    await bot.send_invoice(
+    # Цифровой ли товар? — для физических нужен адрес, тут direct_buy
+    # вызывается уже после ввода адреса (или сразу для цифровых).
+    is_digital = bool(product[6]) if len(product) > 6 else True
+    delivery_addr = states.pop(f"{user_id}_address_direct", None)
+    if not delivery_addr:
+        delivery_addr = "Цифровой товар" if is_digital else "Уточняется"
+
+    order_id = await database.buy_product(
+        shop_id, user_id, product_id, quantity, total,
+        delivery_addr,
+        status=database.ORDER_STATUS_NEW,
+        payment_method='platform_invoice'
+    )
+    if not order_id:
+        await bot.send_message(
+            chat_id,
+            "❌ Не удалось оформить заказ. Попробуйте позже.",
+            reply_markup=_create_shop_main_menu()
+        )
+        states[user_id] = ShopBotState.MAIN_MENU
+        return
+
+    pay_url = f"https://t.me/{config.MANAGER_BOT_USERNAME}?start=pay_{order_id}"
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text=f"💳 Оплатить {total:.2f} ₽", url=pay_url))
+    builder.row(InlineKeyboardButton(text="❌ Отменить", callback_data="shop_main_menu"))
+    await bot.send_message(
         chat_id,
-        title=title,
-        description=description + label_suffix,
-        payload=payload,
-        provider_token=payment_token,
-        currency='RUB',
-        prices=[LabeledPrice(label=f"{title} ×{quantity}{label_suffix}", amount=price_kopecks)],
-        start_parameter='product',
+        f"🧾 Заказ #{order_id} создан.\n\n"
+        f"Товар: <b>{title}</b> ×{quantity}{label_suffix}\n"
+        f"Сумма к оплате: <b>{total:.2f} ₽</b>\n\n"
+        f"Нажмите «Оплатить» — вы перейдёте в платёжный бот платформы. "
+        f"После оплаты вернитесь сюда, заказ перейдёт в статус «оплачен».",
+        parse_mode=ParseMode.HTML,
+        reply_markup=builder.as_markup()
     )
     states[user_id] = ShopBotState.MAIN_MENU
 
@@ -1197,55 +1230,20 @@ async def run_shop_bot(
             await message.answer("Некорректная цена. Введите положительное число или «назад».")
 
     # ─── Платежи ───
-
+    # Платежи теперь обрабатываются МЕНЕДЖЕР-БОТОМ (provider_token Telegram
+    # Payments привязан к конкретному боту через @BotFather). Здесь оставлен
+    # только заглушечный обработчик successful_payment на случай старых
+    # сценариев — ничего не делаем, просто вежливое сообщение.
     @dp.message(F.successful_payment)
-    async def handle_successful_payment(message: Message):
-        try:
-            parts       = message.successful_payment.invoice_payload.split('_')
-            product_id  = int(parts[1])
-            user_id     = int(parts[3])
-            quantity    = int(parts[5])
-            total_price = message.successful_payment.total_amount / 100
-            order_id = await database.buy_product(
-                shop_id, user_id, product_id, quantity, total_price,
-                'Цифровой товар (оплачено)',
-                status=database.ORDER_STATUS_PAID,
-                payment_method='telegram_payments'
-            )
-            if order_id:
-                await message.answer(f"✅ Заказ #{order_id} оплачен!")
-                # Авто-доставка цифрового контента
-                order = await database.get_order(order_id)
-                if order and order.get("digital_content"):
-                    await _deliver_digital(order, bot)
-                else:
-                    await message.answer(
-                        "📋 Раздел «Мои заказы» — для отслеживания статуса.\n"
-                        "Если контент не пришёл автоматически — продавец отправит его вручную."
-                    )
-                # Уведомим продавца
-                shop_info = await database.get_shop_info(shop_id)
-                if shop_info:
-                    admin_ids = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
-                    for aid in set(admin_ids):
-                        try:
-                            await manager_bot.send_message(
-                                aid,
-                                f"💳 Заказ #{order_id} оплачен онлайн.\n"
-                                f"Магазин: {shop_info[2]}\n"
-                                f"Товар: id={product_id} ×{quantity}\n"
-                                f"Сумма: {total_price:.2f}₽"
-                            )
-                        except Exception:
-                            pass
-            else:
-                await message.answer("❌ Ошибка при обработке покупки")
-        except Exception as e:
-            logger.error(f"Ошибка обработки оплаты: {e}")
-            await message.answer("❌ Произошла ошибка при обработке платежа")
+    async def handle_successful_payment_legacy(message: Message):
+        await message.answer(
+            "✅ Платёж получен. Если заказ не отметился оплаченным "
+            "автоматически — обратитесь к продавцу."
+        )
 
     @dp.pre_checkout_query()
     async def pre_checkout(query: PreCheckoutQuery):
+        # На всякий случай — если кто-то всё же дошёл до checkout в shop-боте.
         await query.answer(ok=True)
 
     # ─── Новые состояния: жалоба, возврат, спор ───

@@ -73,6 +73,13 @@ def _parse_id_list(raw: str) -> List[int]:
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
 PAYMENTS_TOKEN: str = os.getenv("PAYMENTS_TOKEN", "").strip()
 
+# Username менеджер-бота (без @). Нужен для deeplink-оплаты:
+# покупатель в магазин-боте получает ссылку t.me/<MANAGER_BOT_USERNAME>?start=pay_<order_id>,
+# по которой переходит в менеджер-бота — там и происходит реальный invoice
+# через Telegram Payments. Если оставить пустым, попробуем определить
+# username через Bot API при старте (см. main.py / fetch_manager_username).
+MANAGER_BOT_USERNAME: str = os.getenv("MANAGER_BOT_USERNAME", "").strip().lstrip("@")
+
 # ── Модерация / Владельцы ────────────────────────────────────────────────
 # Telegram-ID владельцев главного бота (могут удалять любые магазины,
 # закрывать споры, видят все жалобы). Несколько ID указываются через запятую.

@@ -17,8 +17,8 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton,
-    InlineKeyboardMarkup, Message, ReplyKeyboardMarkup,
-    KeyboardButton, ReplyKeyboardRemove,
+    InlineKeyboardMarkup, LabeledPrice, Message, PreCheckoutQuery,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -122,8 +122,67 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     if not await _ensure_terms(user_id, message.from_user.username, message.chat.id):
         return
+    # Deeplink-оплата из магазин-ботов: /start pay_<order_id>
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].startswith("pay_"):
+        try:
+            order_id = int(parts[1].split("_", 1)[1])
+        except (ValueError, IndexError):
+            order_id = 0
+        if order_id:
+            await _send_payment_invoice(message, order_id)
+            return
     user_states[user_id] = UserState.MAIN_MENU
     await message.answer(WELCOME_TEXT, reply_markup=keyboards.create_main_menu())
+
+
+async def _send_payment_invoice(message: Message, order_id: int) -> None:
+    """Отправляет invoice через PAYMENTS_TOKEN для заказа из магазин-бота."""
+    user_id = message.from_user.id
+    order = await database.get_order(order_id)
+    if not order:
+        await message.answer("❌ Заказ не найден.")
+        return
+    if order["customer_user_id"] != user_id:
+        await message.answer("❌ Этот заказ оформлен другим пользователем.")
+        return
+    if order["status"] != database.ORDER_STATUS_NEW:
+        await message.answer(
+            f"ℹ️ Заказ #{order_id} уже в статусе «{database.ORDER_STATUS_LABELS.get(order['status'], order['status'])}». "
+            f"Повторная оплата не нужна."
+        )
+        return
+    if not config.PAYMENTS_TOKEN:
+        await message.answer("❌ Онлайн-оплата временно недоступна. Сообщите продавцу.")
+        return
+    total = float(order["total_price"] or 0)
+    if total <= 0:
+        await message.answer("❌ Некорректная сумма заказа.")
+        return
+    price_kopecks = int(round(total * 100))
+    price_kopecks = max(100, min(price_kopecks, 9_999_900))
+    title = (order.get("product_name") or "Заказ")[:32]
+    desc = (
+        f"Заказ #{order_id} в магазине «{order.get('shop_name') or '—'}»\n"
+        f"{order.get('product_name') or ''} ×{order['quantity']}"
+    )[:255]
+    payload = f"order_{order_id}"
+    try:
+        await bot.send_invoice(
+            chat_id=message.chat.id,
+            title=title,
+            description=desc,
+            payload=payload,
+            provider_token=config.PAYMENTS_TOKEN,
+            currency="RUB",
+            prices=[LabeledPrice(label=title, amount=price_kopecks)],
+            start_parameter=f"pay_{order_id}",
+        )
+    except Exception as e:
+        logger.error(f"send_invoice failed for order {order_id}: {e}")
+        await message.answer(
+            "❌ Не удалось создать счёт на оплату. Попробуйте позже или свяжитесь с продавцом."
+        )
 
 
 @dp.message(Command("terms"))
@@ -447,37 +506,43 @@ async def callback_handler(call: CallbackQuery):
             )
 
         # ── Способ оплаты ──
+        # Поддерживаются: онлайн через единый платёжный шлюз платформы и
+        # оплата при получении (cash_on_delivery). Отдельная настройка
+        # ЮKassa у магазина больше не нужна — токен платформы лежит в .env.
         elif data.startswith("payment_method_"):
             shop_id = int(data.split("_")[-1])
             builder = InlineKeyboardBuilder()
-            builder.row(
-                InlineKeyboardButton(text="Оплата на месте", callback_data=f"set_payment_cash_{shop_id}"),
-                InlineKeyboardButton(text="Онлайн-оплата (ЮKassa)", callback_data=f"set_payment_online_{shop_id}"),
-            )
+            builder.row(InlineKeyboardButton(
+                text="💳 Онлайн через платформу",
+                callback_data=f"set_payment_online_{shop_id}"
+            ))
+            builder.row(InlineKeyboardButton(
+                text="💵 Оплата при получении",
+                callback_data=f"set_payment_cash_{shop_id}"
+            ))
             builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"manage_shop_{shop_id}"))
-            await call.message.edit_text("Выберите способ оплаты:", reply_markup=builder.as_markup())
+            await call.message.edit_text(
+                "Выберите способ оплаты, который будет доступен покупателям в этом магазине:",
+                reply_markup=builder.as_markup()
+            )
 
         elif data.startswith("set_payment_"):
             shop_id      = int(data.split("_")[-1])
             payment_type = "cash_on_delivery" if "cash" in data else "online"
-            if payment_type == "cash_on_delivery":
-                await database.update_payment_method(shop_id, payment_type)
-                await call.message.edit_text(
-                    "✅ Способ оплаты установлен: Оплата на месте",
-                    reply_markup=keyboards.create_shop_management_menu(shop_id)
-                )
-            else:
-                user_states[user_id]                  = UserState.EDITING_PAYMENT
-                user_states[_uid(user_id, "shop_id")] = shop_id
-                await call.message.edit_text(
-                    "Настройка ЮKassa:\n"
-                    "1. Зарегистрируйтесь на https://yookassa.ru/\n"
-                    "2. Получите Shop ID и Secret Key в личном кабинете\n"
-                    "3. Введите данные в формате: ShopID:SecretKey\n"
-                    "Пример: 123456:live_xxxxxxxxxxxxxxxxxxxxxxxxxxxx\n\n"
-                    "Отправьте 'назад' для отмены",
-                    reply_markup=keyboards.create_back_button_menu(f"payment_method_{shop_id}")
-                )
+            await database.update_payment_method(shop_id, payment_type)
+            label = ("💵 Оплата при получении"
+                     if payment_type == "cash_on_delivery"
+                     else "💳 Онлайн через платформу")
+            extra = ("\n\nДеньги будут списываться у покупателя в менеджер-боте платформы "
+                     "и зачисляться на ваш внутренний баланс. Выводите их в разделе "
+                     "«💰 Финансы»."
+                     if payment_type == "online" else
+                     "\n\nДеньги вы получаете напрямую при передаче товара покупателю. "
+                     "Платформа в этом случае не участвует в расчётах.")
+            await call.message.edit_text(
+                f"✅ Способ оплаты установлен: {label}.{extra}",
+                reply_markup=keyboards.create_shop_management_menu(shop_id)
+            )
 
         # ── Удаление магазина ──
         elif data.startswith("delete_shop_"):
@@ -2286,6 +2351,125 @@ async def handle_admin_reply(message: Message):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  Платежи: pre_checkout + successful_payment
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dp.pre_checkout_query()
+async def manager_pre_checkout(query: PreCheckoutQuery):
+    payload = query.invoice_payload or ""
+    order_id = 0
+    if payload.startswith("order_"):
+        try:
+            order_id = int(payload.split("_", 1)[1])
+        except (ValueError, IndexError):
+            order_id = 0
+    if not order_id:
+        await query.answer(ok=False, error_message="Некорректный заказ.")
+        return
+    order = await database.get_order(order_id)
+    if not order:
+        await query.answer(ok=False, error_message="Заказ не найден.")
+        return
+    if order["status"] != database.ORDER_STATUS_NEW:
+        await query.answer(ok=False, error_message="Заказ уже оплачен или отменён.")
+        return
+    if order["customer_user_id"] != query.from_user.id:
+        await query.answer(ok=False, error_message="Заказ принадлежит другому пользователю.")
+        return
+    expected = int(round(float(order["total_price"] or 0) * 100))
+    if query.total_amount != expected:
+        await query.answer(ok=False, error_message="Сумма не совпадает с заказом.")
+        return
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def manager_successful_payment(message: Message):
+    payload = message.successful_payment.invoice_payload or ""
+    if not payload.startswith("order_"):
+        await message.answer("✅ Платёж получен.")
+        return
+    try:
+        order_id = int(payload.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await message.answer("✅ Платёж получен, но не удалось определить заказ.")
+        return
+    order = await database.get_order(order_id)
+    if not order:
+        await message.answer(f"✅ Платёж получен, но заказ #{order_id} не найден.")
+        return
+    # Переводим в paid через update_order_status — это автоматически зачислит
+    # деньги на внутренний баланс продавца (для платёжного метода != cash).
+    await database.update_order_status(order_id, database.ORDER_STATUS_PAID)
+    order = await database.get_order(order_id)  # перечитаем с обновлённым статусом
+    shop_id = order["shop_id"]
+    shop_name = order.get("shop_name") or f"shop#{shop_id}"
+    total = float(order["total_price"] or 0)
+    # 1. Покупателю: подтверждение и (если есть) цифровой контент.
+    await message.answer(
+        f"✅ Заказ #{order_id} оплачен!\n"
+        f"Магазин: {shop_name}\n"
+        f"Сумма: {total:.2f} ₽\n\n"
+        f"Возвращайтесь в магазин-бот — там увидите статус «оплачен» в «Мои заказы»."
+    )
+    if order.get("digital_content"):
+        try:
+            await _deliver_digital_content(message.from_user.id, order)
+        except Exception as e:
+            logger.error(f"digital delivery failed for order {order_id}: {e}")
+    # 2. Продавцу/админам магазина — уведомление.
+    admin_ids = []
+    shop_info = await database.get_shop_info(shop_id)
+    if shop_info:
+        admin_ids = [shop_info[1]] + await database.get_shop_admins_ids(shop_id)
+    for aid in set(admin_ids):
+        try:
+            await bot.send_message(
+                aid,
+                f"💳 Поступила оплата по заказу #{order_id}\n"
+                f"Магазин: {shop_name}\n"
+                f"Товар: {order.get('product_name')} ×{order['quantity']}\n"
+                f"Сумма: <b>{total:.2f} ₽</b> → начислено на ваш баланс платформы.",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logger.error(f"Не удалось уведомить админа {aid} об оплате #{order_id}: {e}")
+
+
+async def _deliver_digital_content(user_id: int, order: dict) -> None:
+    """Отправляет покупателю цифровой контент заказа из менеджер-бота."""
+    kind = order.get("digital_content_kind")
+    content = order.get("digital_content")
+    ttl = order.get("digital_ttl_hours")
+    if not content:
+        return
+    ttl_note = f"\n\n⏳ Действует {ttl} ч от момента оплаты." if ttl else ""
+    header = f"📦 Ваш цифровой товар по заказу #{order['id']}:{ttl_note}\n\n"
+    if kind == "text":
+        await bot.send_message(user_id, header + content)
+    elif kind == "url":
+        await bot.send_message(user_id, header + content, disable_web_page_preview=False)
+    elif kind in ("photo_id", "photo_path"):
+        try:
+            if kind == "photo_path" and os.path.exists(content):
+                await bot.send_photo(user_id, FSInputFile(content), caption=header)
+            else:
+                await bot.send_photo(user_id, content, caption=header)
+        except Exception:
+            await bot.send_message(user_id, header + "(не удалось отправить файл — обратитесь к продавцу)")
+    elif kind in ("file_id", "file_path"):
+        try:
+            if kind == "file_path" and os.path.exists(content):
+                await bot.send_document(user_id, FSInputFile(content), caption=header)
+            else:
+                await bot.send_document(user_id, content, caption=header)
+        except Exception:
+            await bot.send_message(user_id, header + "(не удалось отправить файл — обратитесь к продавцу)")
+    else:
+        await bot.send_message(user_id, header + str(content))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  Точка входа
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -2293,6 +2477,16 @@ async def main():
     print("Инициализация базы данных...")
     database.init_database()
     print("База данных готова!")
+
+    # Узнаём username менеджер-бота — он нужен магазин-ботам для deeplink-оплаты.
+    if not config.MANAGER_BOT_USERNAME:
+        try:
+            me = await bot.get_me()
+            if me and me.username:
+                config.MANAGER_BOT_USERNAME = me.username
+                print(f"MANAGER_BOT_USERNAME автоопределён: @{me.username}")
+        except Exception as e:
+            logger.error(f"Не удалось получить username менеджер-бота: {e}")
 
     # Запускаем боты магазинов, у которых уже есть токен
     import aiosqlite

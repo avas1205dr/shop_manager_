@@ -1449,9 +1449,16 @@ async def update_order_status(order_id: int, new_status: str,
     if not old:
         return False
     old_status = old.get("status")
+    # Был ли уже зафиксирован факт оплаты (paid_at != NULL). Если да — значит
+    # баланс продавца уже зачислялся на этом заказе, и повторно его трогать
+    # нельзя (например, при переходе PAID → REFUND_REQUESTED → PAID или
+    # PAID → DISPUTED → PAID после отклонения возврата/спора).
+    already_paid_once = bool(old.get("paid_at"))
     fields = ["status=?", "updated_at=CURRENT_TIMESTAMP"]
     params = [new_status]
-    if new_status == ORDER_STATUS_PAID:
+    # paid_at выставляем только при ПЕРВОМ переходе в PAID (чтобы не путать
+    # учёт баланса при возвратах в PAID), сохраняя оригинальную дату оплаты.
+    if new_status == ORDER_STATUS_PAID and not already_paid_once:
         fields.append("paid_at=CURRENT_TIMESTAMP")
     if new_status == ORDER_STATUS_DELIVERED:
         fields.append("delivered_at=CURRENT_TIMESTAMP")
@@ -1474,8 +1481,12 @@ async def update_order_status(order_id: int, new_status: str,
     # продавца на платформе не меняем (он получит наличные напрямую).
     is_cash = pmethod == "cash_on_delivery"
     if total > 0 and shop_id and not is_cash:
-        # Перевод в PAID впервые → +на баланс продавца.
-        if new_status == ORDER_STATUS_PAID and old_status != ORDER_STATUS_PAID:
+        # Перевод в PAID впервые → +на баланс продавца. На повторных переходах
+        # (PAID → REFUND_REQUESTED → PAID, PAID → DISPUTED → PAID) баланс уже
+        # начислялся при первом PAID — определяем это по выставленному paid_at.
+        if (new_status == ORDER_STATUS_PAID
+                and old_status != ORDER_STATUS_PAID
+                and not already_paid_once):
             await credit_seller_balance(shop_id, total, source=f"order_paid:{order_id}")
         # Возврат после оплаты → списываем с продавца обратно. Если оплачено
         # никогда не было (статус сразу cancel из new) — ничего не делаем.
