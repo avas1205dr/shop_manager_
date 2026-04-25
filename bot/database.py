@@ -1560,11 +1560,14 @@ async def open_dispute(order_id: int, opened_by: int, opener_role: str,
             (order_id, order["shop_id"], opened_by, opener_role, reason)
         ) as cur:
             did = cur.lastrowid
-        await db.execute(
-            "UPDATE orders SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (ORDER_STATUS_DISPUTED, order_id)
-        )
         await db.commit()
+    # Перевод в DISPUTED делаем через update_order_status, а не прямым SQL,
+    # чтобы вся финансовая логика (credit/debit, paid_at, closed_at и пр.)
+    # шла через единую точку. Сейчас на DISPUTED финансовых эффектов нет,
+    # но если их добавят — они автоматически подхватятся для споров,
+    # открытых здесь. Резолюция спора (resolve_dispute) уже использует
+    # update_order_status — поддерживаем симметрию.
+    await update_order_status(order_id, ORDER_STATUS_DISPUTED)
     return did
 
 

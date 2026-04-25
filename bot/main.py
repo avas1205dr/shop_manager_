@@ -171,8 +171,17 @@ async def _send_payment_invoice(message: Message, order_id: int) -> None:
             "(1 ₽). Пожалуйста, обратитесь к продавцу."
         )
         return
+    # Раньше при price_kopecks > 9_999_900 мы молча клампили сверху, но
+    # manager_pre_checkout сравнивает с total_price из БД без clamp →
+    # покупатель видел invoice, который заведомо не сможет оплатить
+    # ("Сумма не совпадает с заказом"). Корректнее сразу отказать с
+    # понятным сообщением и не отправлять заведомо нерабочий счёт.
     if price_kopecks > 9_999_900:
-        price_kopecks = 9_999_900
+        await message.answer(
+            "❌ Сумма заказа превышает максимально допустимую для онлайн-оплаты "
+            "(99 999 ₽). Разделите покупку или обратитесь к продавцу."
+        )
+        return
     title = (order.get("product_name") or "Заказ")[:32]
     desc = (
         f"Заказ #{order_id} в магазине «{order.get('shop_name') or '—'}»\n"
