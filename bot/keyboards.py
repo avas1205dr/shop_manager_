@@ -66,7 +66,7 @@ def create_shop_management_menu(shop_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
         InlineKeyboardButton(text="🔑 API бота", callback_data=f"edit_token_{shop_id}"),
-        InlineKeyboardButton(text="💳 PayMaster Токен", callback_data=f"paymaster_token_{shop_id}"),
+        InlineKeyboardButton(text="💰 Финансы", callback_data=f"finance_{shop_id}"),
     )
     builder.row(
         InlineKeyboardButton(text="📦 Товары", callback_data=f"manage_products_{shop_id}"),
@@ -86,6 +86,46 @@ def create_shop_management_menu(shop_id: int) -> InlineKeyboardMarkup:
     )
     builder.row(InlineKeyboardButton(text="🗑️ Удалить магазин", callback_data=f"delete_shop_{shop_id}"))
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="my_shops"))
+    return builder.as_markup()
+
+
+# ─────────────────── ФИНАНСЫ МАГАЗИНА ───────────────────
+
+def create_finance_menu(shop_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="💸 Запросить вывод",
+                                     callback_data=f"withdraw_start_{shop_id}"))
+    builder.row(InlineKeyboardButton(text="📜 История выводов",
+                                     callback_data=f"withdraw_history_{shop_id}"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"manage_shop_{shop_id}"))
+    return builder.as_markup()
+
+
+def create_withdraw_method_menu(shop_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    methods = [
+        ("card",     "💳 Карта"),
+        ("sbp",      "📱 СБП"),
+        ("business", "🧾 ИП/самозанятый"),
+        ("crypto",   "🪙 Крипта"),
+    ]
+    for code, label in methods:
+        builder.row(InlineKeyboardButton(
+            text=label, callback_data=f"withdraw_method_{shop_id}_{code}"
+        ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"finance_{shop_id}"))
+    return builder.as_markup()
+
+
+def create_withdraw_owner_menu(withdrawal_id: int) -> InlineKeyboardMarkup:
+    """Кнопки в уведомлении владельцу о новом запросе на вывод."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Отметить выплачено",
+                             callback_data=f"withdraw_paid_{withdrawal_id}"),
+        InlineKeyboardButton(text="❌ Отклонить",
+                             callback_data=f"withdraw_reject_{withdrawal_id}"),
+    )
     return builder.as_markup()
 
 
@@ -148,13 +188,15 @@ def create_confirm_remove_step2_menu(shop_id: int, worker_id: int) -> InlineKeyb
 # ─────────────────── ЗАКАЗЫ ───────────────────
 
 def create_orders_menu(shop_id: int, orders, page: int = 0, per_page: int = 5) -> InlineKeyboardMarkup:
+    from database import ORDER_STATUS_LABELS
     builder = InlineKeyboardBuilder()
     start = page * per_page
     end = min(start + per_page, len(orders))
     for order in orders[start:end]:
         order_id, _, product_name, quantity, total_price, _, status, _, username = order
+        label_status = ORDER_STATUS_LABELS.get(status, status)
         builder.row(InlineKeyboardButton(
-            text=f"#{order_id} {product_name} x{quantity} - {status}",
+            text=f"#{order_id} {product_name} ×{quantity} — {label_status}",
             callback_data=f"order_detail_{order_id}"
         ))
     nav = []
@@ -221,6 +263,7 @@ def create_edit_product_menu(product_id: int, category_id: int, page: int = 0) -
     builder.row(InlineKeyboardButton(text="🖼️ Изменить фото", callback_data=f"edit_photo_{product_id}_{category_id}_{page}"))
     builder.row(InlineKeyboardButton(text="👁️ Показать товар", callback_data=f"show_product_{product_id}_{category_id}_{page}"))
     builder.row(InlineKeyboardButton(text="🏷️ Скидка на товар", callback_data=f"edit_sale_{product_id}_{category_id}_{page}"))
+    builder.row(InlineKeyboardButton(text="💾 Цифровой контент", callback_data=f"digital_menu_{product_id}_{category_id}_{page}"))
     builder.row(InlineKeyboardButton(text="🗑️ Удалить товар", callback_data=f"delete_product_{product_id}_{category_id}_{page}"))
     builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data=f"back_to_products_{category_id}_{page}"))
     return builder.as_markup()
@@ -259,4 +302,228 @@ def create_promo_type_menu(shop_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="₽ Фиксированная", callback_data=f"promo_type_fixed_{shop_id}"),
     )
     builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"manage_promocodes_{shop_id}"))
+    return builder.as_markup()
+
+# ─────────────────── ПРАВИЛА (TERMS) ───────────────────
+
+def create_terms_acceptance_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="📜 Прочитать правила", callback_data="terms_show"))
+    builder.row(InlineKeyboardButton(text="📋 Запрещённые товары", callback_data="terms_legal"))
+    builder.row(InlineKeyboardButton(text="✅ Принимаю", callback_data="terms_accept"))
+    return builder.as_markup()
+
+
+def create_terms_back_menu(back_callback: str = "terms_back") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="✅ Принимаю", callback_data="terms_accept"))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data=back_callback))
+    return builder.as_markup()
+
+
+# ─────────────────── ЗАКАЗЫ — ДЕТАЛИ У АДМИНА ───────────────────
+
+def create_order_admin_menu(order: dict) -> InlineKeyboardMarkup:
+    """Меню действий админа над заказом (с учётом текущего статуса)."""
+    from database import (
+        ORDER_STATUS_NEW, ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING,
+        ORDER_STATUS_SHIPPED, ORDER_STATUS_DELIVERED, ORDER_STATUS_COMPLETED,
+        ORDER_STATUS_CANCELED, ORDER_STATUS_REFUND_REQUESTED,
+        ORDER_STATUS_REFUNDED, ORDER_STATUS_DISPUTED,
+    )
+    oid    = order["id"]
+    status = order["status"]
+    is_dig = bool(order["is_digital"])
+
+    builder = InlineKeyboardBuilder()
+    if status in (ORDER_STATUS_NEW, ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING):
+        builder.row(InlineKeyboardButton(
+            text="⚙️ В обработку", callback_data=f"adm_order_set_{oid}_processing"
+        ))
+    if not is_dig and status in (ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING):
+        builder.row(InlineKeyboardButton(
+            text="📦 Отправлен", callback_data=f"adm_order_set_{oid}_shipped"
+        ))
+    if status in (ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING, ORDER_STATUS_SHIPPED):
+        builder.row(InlineKeyboardButton(
+            text="🚚 Доставлен", callback_data=f"adm_order_set_{oid}_delivered"
+        ))
+    if is_dig and status in (ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING):
+        builder.row(InlineKeyboardButton(
+            text="📤 Выдать цифровой контент", callback_data=f"adm_order_deliver_{oid}"
+        ))
+    if status in (ORDER_STATUS_DELIVERED, ORDER_STATUS_SHIPPED, ORDER_STATUS_PAID):
+        builder.row(InlineKeyboardButton(
+            text="✅ Завершить", callback_data=f"adm_order_set_{oid}_completed"
+        ))
+    if status == ORDER_STATUS_REFUND_REQUESTED:
+        builder.row(
+            InlineKeyboardButton(text="💸 Подтвердить возврат",
+                                 callback_data=f"adm_order_set_{oid}_refunded"),
+            InlineKeyboardButton(text="❌ Отклонить",
+                                 callback_data=f"adm_order_set_{oid}_paid"),
+        )
+    if status not in (ORDER_STATUS_REFUNDED, ORDER_STATUS_COMPLETED,
+                      ORDER_STATUS_CANCELED, ORDER_STATUS_DISPUTED):
+        builder.row(InlineKeyboardButton(
+            text="❌ Отменить", callback_data=f"adm_order_set_{oid}_canceled"
+        ))
+    if status != ORDER_STATUS_DISPUTED:
+        builder.row(InlineKeyboardButton(
+            text="⚖️ Открыть спор", callback_data=f"adm_dispute_open_{oid}"
+        ))
+    builder.row(InlineKeyboardButton(
+        text="💬 Покупателю", callback_data=f"adm_order_msg_{oid}"
+    ))
+    shop_id = order["shop_id"]
+    builder.row(InlineKeyboardButton(text="⬅️ К списку", callback_data=f"view_orders_{shop_id}"))
+    return builder.as_markup()
+
+
+# ─────────────────── ЦИФРОВОЙ КОНТЕНТ — РЕДАКТОР ───────────────────
+
+def create_digital_content_menu(product_id: int, category_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="📝 Изменить цифровой контент",
+        callback_data=f"edit_digital_{product_id}_{category_id}_{page}"
+    ))
+    builder.row(InlineKeyboardButton(
+        text="⏰ Срок действия (часы)",
+        callback_data=f"edit_dttl_{product_id}_{category_id}_{page}"
+    ))
+    builder.row(InlineKeyboardButton(
+        text="🗑️ Очистить цифровой контент",
+        callback_data=f"clear_digital_{product_id}_{category_id}_{page}"
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад",
+        callback_data=f"product_{product_id}_{category_id}_{page}"))
+    return builder.as_markup()
+
+
+# ─────────────────── МОЯ ИСТОРИЯ ЗАКАЗОВ (магазин-бот) ───────────────────
+
+def create_my_orders_menu(orders, page: int = 0, per_page: int = 5) -> InlineKeyboardMarkup:
+    from database import ORDER_STATUS_LABELS
+    builder = InlineKeyboardBuilder()
+    start = page * per_page
+    end = min(start + per_page, len(orders))
+    for order in orders[start:end]:
+        oid, _grp, _shop_id, _shop_name, prod_name, qty, price, status, _ = order
+        label_status = ORDER_STATUS_LABELS.get(status, status)
+        builder.row(InlineKeyboardButton(
+            text=f"#{oid} {prod_name} ×{qty} — {label_status}",
+            callback_data=f"my_order_{oid}"
+        ))
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"my_orders_page_{page - 1}"))
+    if end < len(orders):
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"my_orders_page_{page + 1}"))
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="shop_main_menu"))
+    return builder.as_markup()
+
+
+def create_my_order_actions_menu(order: dict) -> InlineKeyboardMarkup:
+    from database import (
+        ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING, ORDER_STATUS_SHIPPED,
+        ORDER_STATUS_DELIVERED, ORDER_STATUS_COMPLETED,
+        ORDER_STATUS_REFUND_REQUESTED, ORDER_STATUS_REFUNDED,
+        ORDER_STATUS_CANCELED, ORDER_STATUS_DISPUTED, ORDER_STATUS_NEW,
+    )
+    oid    = order["id"]
+    status = order["status"]
+    builder = InlineKeyboardBuilder()
+    if status == ORDER_STATUS_DELIVERED:
+        builder.row(InlineKeyboardButton(
+            text="✅ Подтвердить получение", callback_data=f"my_order_confirm_{oid}"
+        ))
+    if status in (ORDER_STATUS_PAID, ORDER_STATUS_PROCESSING, ORDER_STATUS_SHIPPED,
+                  ORDER_STATUS_DELIVERED):
+        builder.row(InlineKeyboardButton(
+            text="↩️ Запросить возврат", callback_data=f"my_order_refund_{oid}"
+        ))
+    if status not in (ORDER_STATUS_REFUNDED, ORDER_STATUS_CANCELED,
+                      ORDER_STATUS_DISPUTED):
+        builder.row(InlineKeyboardButton(
+            text="⚖️ Открыть спор", callback_data=f"my_order_dispute_{oid}"
+        ))
+    if status == ORDER_STATUS_NEW:
+        builder.row(InlineKeyboardButton(
+            text="❌ Отменить заказ", callback_data=f"my_order_cancel_{oid}"
+        ))
+    builder.row(InlineKeyboardButton(text="⬅️ К моим заказам", callback_data="my_orders"))
+    return builder.as_markup()
+
+
+# ─────────────────── ЖАЛОБЫ И МОДЕРАЦИЯ ───────────────────
+
+def create_complaint_button(shop_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="🚩 Пожаловаться на магазин", callback_data=f"shop_complain_{shop_id}"
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="shop_main_menu"))
+    return builder.as_markup()
+
+
+def create_moderation_main_menu() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="🔍 Магазины на проверке", callback_data="mod_under_review"
+    ))
+    builder.row(InlineKeyboardButton(
+        text="⚖️ Открытые споры", callback_data="mod_open_disputes"
+    ))
+    builder.row(InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu"))
+    return builder.as_markup()
+
+
+def create_under_review_list_menu(shops) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for shop_id, shop_name, _owner, _reason in shops:
+        builder.row(InlineKeyboardButton(
+            text=f"🏪 {shop_name}", callback_data=f"mod_shop_{shop_id}"
+        ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="moderation_main"))
+    return builder.as_markup()
+
+
+def create_moderation_shop_menu(shop_id: int, can_delete: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(
+        text="✅ Снять с проверки", callback_data=f"mod_shop_clear_{shop_id}"
+    ))
+    if can_delete:
+        builder.row(InlineKeyboardButton(
+            text="🗑️ Удалить магазин", callback_data=f"mod_shop_delete_{shop_id}"
+        ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="mod_under_review"))
+    return builder.as_markup()
+
+
+def create_open_disputes_menu(disputes) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for did, oid, _shop_id, shop_name, opener, _reason, _created in disputes:
+        builder.row(InlineKeyboardButton(
+            text=f"#{did} ({shop_name}, {opener})", callback_data=f"mod_dispute_{did}"
+        ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="moderation_main"))
+    return builder.as_markup()
+
+
+def create_dispute_resolution_menu(dispute_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="💸 Возврат покупателю",
+                             callback_data=f"mod_disp_resolve_{dispute_id}_refund"),
+        InlineKeyboardButton(text="✅ В пользу продавца",
+                             callback_data=f"mod_disp_resolve_{dispute_id}_complete"),
+    )
+    builder.row(InlineKeyboardButton(
+        text="⛔ Отклонить спор", callback_data=f"mod_disp_resolve_{dispute_id}_reject"
+    ))
+    builder.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="mod_open_disputes"))
     return builder.as_markup()

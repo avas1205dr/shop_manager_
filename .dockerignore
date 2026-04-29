@@ -1,0 +1,49 @@
+# VCS / IDE
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+.vscode
+
+# Виртуальные окружения / pyc
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# Локальные секреты — НИКОГДА не пихаем в образ
+.env
+.env.*
+!.env.example
+
+# Локальные данные (приедут в контейнер через volume /data)
+db/
+digital_content/
+product_images/
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи / временные файлы
+*.log
+logs/
+tmp/
+.tmp/
+
+# Документация / прочее, что не нужно в образе
+README.md
+prompt.txt
+docs/
+*.md
+
+# Сам Dockerfile / compose внутри образа не нужны
+Dockerfile
+docker-compose*.yml
+.dockerignore

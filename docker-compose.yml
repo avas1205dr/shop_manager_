@@ -1,0 +1,33 @@
+# Запуск платформенного бота одной командой:
+#   cp .env.example .env && nano .env       # заполнить токены
+#   docker compose up -d --build
+#
+# Все рабочие данные (SQLite-БД, цифровой контент, фото товаров) лежат в
+# bind-mount'е ./data и переживают пересоздание контейнера. Чтобы перенести
+# инсталляцию на другой хост — достаточно скопировать .env и ./data.
+services:
+  bot:
+    build: .
+    image: shop-manager-bot:latest
+    container_name: shop-manager-bot
+    restart: unless-stopped
+    # network_mode: host — контейнер использует сетевой стек хоста
+    # напрямую, без docker-bridge и NAT. Это важно, если на сервере
+    # работает WireGuard / custom iptables PostUp, которые могут
+    # смыть правила docker'а в POSTROUTING/FORWARD (приводит к
+    # Errno 101 Network is unreachable из контейнера). Боту bridge
+    # не нужен — он не слушает входящих портов, а только исходящий
+    # long-polling к api.telegram.org.
+    network_mode: host
+    env_file:
+      - .env
+    environment:
+      # Внутри контейнера БД и медиа лежат в /data — переопределяем дефолт
+      # из bot/config.py.
+      DB_PATH: /data/db/shop_manager.db
+      TZ: ${TZ:-Europe/Moscow}
+    volumes:
+      - ./data:/data
+    # Если хочется писать логи через journald — раскомментировать:
+    # logging:
+    #   driver: journald

@@ -11,7 +11,6 @@ class UserState:
     PRODUCT_TYPE = "product_type"
     PRODUCT_DESCRIPTION = "product_description"
     PRODUCT_IMAGE = "product_image"
-    EDITING_PAYMENT = "editing_payment"
     ADDING_ADMIN = "adding_admin"
     GET_USER_ID = "get_user_id"
     EDITING_PRODUCT = "editing_product"
@@ -20,13 +19,29 @@ class UserState:
     REMOVING_WORKER = "removing_worker"
     EDITING_CATEGORY_NAME = "editing_category_name"
     DELETING_CATEGORY = "deleting_category"
-    EDITING_PAYMASTER = "editing_paymaster"
     BROADCAST_MESSAGE = "broadcast_message"
 
     # Промокоды
     MANAGE_PROMOCODES = "manage_promocodes"
     ADDING_PROMO_CODE = "adding_promo_code"
     ADDING_PROMO_VALUE = "adding_promo_value"
+
+    # Цифровая доставка
+    EDITING_DIGITAL_CONTENT = "editing_digital_content"
+    EDITING_DIGITAL_TTL = "editing_digital_ttl"
+
+    # Споры/возвраты у админа
+    REPLYING_DISPUTE = "replying_dispute"
+
+    # Модерация (главный бот)
+    MOD_REJECT_REASON = "mod_reject_reason"
+
+    # Финансы / вывод средств
+    WITHDRAW_AMOUNT     = "withdraw_amount"
+    WITHDRAW_REQUISITES = "withdraw_requisites"
+
+    # Владелец отклоняет вывод (вводит причину)
+    WITHDRAW_REJECT_NOTE = "withdraw_reject_note"
 
 
 class ShopBotState:
@@ -52,3 +67,13 @@ class ShopBotState:
     ENTERING_PROMOCODE = "entering_promocode"
     # Промокод при прямой покупке (кнопка «Заказать»)
     ENTERING_PROMOCODE_DIRECT = "entering_promocode_direct"
+    # Адрес при прямой покупке (физический товар)
+    ENTERING_ADDRESS_DIRECT = "entering_address_direct"
+
+    # Жалоба на магазин
+    COMPLAINT_REASON = "complaint_reason"
+
+    # Спор по заказу / запрос возврата
+    DISPUTE_REASON = "dispute_reason"
+    REFUND_REASON = "refund_reason"
+    DISPUTE_REPLY = "dispute_reply"
